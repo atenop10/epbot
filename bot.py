@@ -1,0 +1,554 @@
+"""AUDIOS FM episodes bot - standalone (no website needed).
+
+- Audio is read straight from your Cloudflare R2 bucket (keys look like audio/<story id>/<file>.mp3).
+- Paid users are managed inside the bot by the admin: /grant <telegram id> <days>.
+- Sent audio is protected (no forward/save) and auto-deleted.
+"""
+import asyncio
+import io
+import logging
+import os
+import re
+import sqlite3
+import time
+from contextlib import closing
+from datetime import datetime
+
+import boto3
+from botocore.config import Config
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram.ext import (
+    Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
+)
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+R2_ENDPOINT = os.environ["R2_ENDPOINT"]
+R2_BUCKET = os.environ["R2_BUCKET"]
+R2_KEY_ID = os.environ["R2_ACCESS_KEY_ID"]
+R2_SECRET = os.environ["R2_SECRET_ACCESS_KEY"]
+DELETE_AFTER = int(os.environ.get("DELETE_AFTER_SECONDS", "5400"))
+MAX_RANGE = int(os.environ.get("MAX_RANGE", "30"))
+TG_MAX_BYTES = int(os.environ.get("TG_MAX_BYTES", str(49 * 1024 * 1024)))  # Bot API upload limit ~50 MB
+CONTACT_TEXT = os.environ.get("CONTACT_TEXT", "Contact the admin to subscribe.")
+DB_PATH = os.environ.get("DB_PATH", "bot.db")
+# Paid-only mode is OFF by default. Set REQUIRE_SUBSCRIPTION=true in .env to turn it back on.
+REQUIRE_SUB = os.environ.get("REQUIRE_SUBSCRIPTION", "false").strip().lower() in ("1", "true", "yes", "on")
+
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("episodes-bot")
+
+s3 = boto3.client(
+    "s3", endpoint_url=R2_ENDPOINT, aws_access_key_id=R2_KEY_ID, aws_secret_access_key=R2_SECRET,
+    region_name="auto", config=Config(signature_version="s3v4", s3={"addressing_style": "path"},
+                                      retries={"max_attempts": 3}),
+)
+KEY_RE = re.compile(r"^audio/(\d+)/[^/]+\.(mp3|m4a|aac|wav|ogg|opus|webm|flac)$", re.I)
+
+
+# ------------------------------------------------------------ database
+def db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def init_db():
+    with closing(db()) as con:
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS subs(user_id INTEGER PRIMARY KEY, expires_at INTEGER NOT NULL, note TEXT);
+        CREATE TABLE IF NOT EXISTS stories(story_id INTEGER PRIMARY KEY, title TEXT);
+        CREATE TABLE IF NOT EXISTS episodes(
+            key TEXT PRIMARY KEY, story_id INTEGER NOT NULL, seq INTEGER NOT NULL,
+            size INTEGER NOT NULL, modified INTEGER NOT NULL, file_id TEXT, kind TEXT,
+            UNIQUE(story_id, seq));
+        """)
+        con.commit()
+
+
+def fmt(ts):
+    return datetime.fromtimestamp(ts).strftime("%d %b %Y")
+
+
+def sub_expiry(uid):
+    with closing(db()) as con:
+        r = con.execute("SELECT expires_at FROM subs WHERE user_id=?", (uid,)).fetchone()
+    return r["expires_at"] if r else 0
+
+
+async def check_access(uid):
+    if not REQUIRE_SUB or uid in ADMIN_IDS or sub_expiry(uid) > time.time():
+        return True, ""
+    exp = sub_expiry(uid)
+    head = "⛔ Your subscription has expired." if exp else "🔒 This bot is only for paid members."
+    return False, f"{head}\n{CONTACT_TEXT}\n\nYour Telegram ID: {uid}"
+
+
+async def guard(update):
+    ok, msg = await check_access(update.effective_user.id)
+    if not ok:
+        await update.effective_message.reply_text(msg)
+    return ok
+
+
+# ------------------------------------------------------------ R2
+def r2_scan():
+    found = []
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=R2_BUCKET, Prefix="audio/"):
+        for o in page.get("Contents", []):
+            m = KEY_RE.match(o["Key"])
+            if m:
+                found.append((o["Key"], int(m.group(1)), o["Size"], int(o["LastModified"].timestamp())))
+    return found
+
+
+def r2_get(key):
+    return s3.get_object(Bucket=R2_BUCKET, Key=key)["Body"].read()
+
+
+async def do_sync():
+    found = await asyncio.to_thread(r2_scan)
+    live = {k for k, *_ in found}
+    added = removed = 0
+    with closing(db()) as con:
+        for (key,) in con.execute("SELECT key FROM episodes").fetchall():
+            if key not in live:
+                con.execute("DELETE FROM episodes WHERE key=?", (key,))
+                removed += 1
+        have = {r["key"] for r in con.execute("SELECT key FROM episodes")}
+        by_story = {}
+        for key, sid, size, mod in found:
+            if key not in have:
+                by_story.setdefault(sid, []).append((mod, key, size))
+        for sid, items in by_story.items():
+            con.execute("INSERT OR IGNORE INTO stories(story_id, title) VALUES(?, NULL)", (sid,))
+            nxt = con.execute("SELECT COALESCE(MAX(seq),0) FROM episodes WHERE story_id=?", (sid,)).fetchone()[0]
+            for mod, key, size in sorted(items):
+                nxt += 1
+                con.execute("INSERT INTO episodes(key, story_id, seq, size, modified) VALUES(?,?,?,?,?)",
+                            (key, sid, nxt, size, mod))
+                added += 1
+        con.commit()
+        stories = con.execute("SELECT COUNT(*) FROM stories").fetchone()[0]
+    return added, removed, stories
+
+
+# ------------------------------------------------------------ texts
+def help_text(is_admin):
+    t = (
+        "🎧 How to use\n"
+        "1. Type a series name to search.\n"
+        "2. Tap the series - you'll see how many episodes it has.\n"
+        "3. Send an episode number (350) or a range (350-370).\n\n"
+        f"Episodes are protected and auto-delete after {max(DELETE_AFTER // 60, 1)} min - listen or save quickly.\n\n"
+        "/start - welcome\n/help - this message\n/status - your subscription"
+    )
+    if is_admin:
+        t += (
+            "\n\n🛠 Admin\n"
+            "/addto <story id> [title] - then just send audio files here; each becomes the next episode\n"
+            "/done - stop adding\n"
+            "/sync - scan Cloudflare R2 for new episodes\n"
+            "/stories - list story ids (named / unnamed)\n"
+            "/name <story id> <title> - give a story its name (needed for search)\n"
+            "/swap <story id> <a> <b> - swap two episode numbers\n"
+            "/grant <telegram id> <days> - give/extend access\n"
+            "/revoke <telegram id> - remove access\n"
+            "/subs - list paid users\n"
+            "/clearcache - forget cached Telegram files\n"
+            "/stats\n\nAdmins don't need a subscription."
+        )
+    return t
+
+
+async def delete_job(context):
+    d = context.job.data
+    try:
+        await context.bot.delete_message(d["chat_id"], d["message_id"])
+    except Exception as e:
+        log.warning("auto-delete failed: %s", e)
+
+
+async def reply_long(update, text):
+    for i in range(0, len(text), 3800):
+        await update.message.reply_text(text[i:i + 3800])
+
+
+# ------------------------------------------------------------ user commands
+async def cmd_start(update, context):
+    ok, msg = await check_access(update.effective_user.id)
+    await update.message.reply_text("Welcome to AUDIOS FM! Send a series name to search. /help for instructions." if ok else msg)
+
+
+async def cmd_help(update, context):
+    await update.message.reply_text(help_text(update.effective_user.id in ADMIN_IDS))
+
+
+async def cmd_status(update, context):
+    uid = update.effective_user.id
+    if uid in ADMIN_IDS:
+        await update.message.reply_text("👑 Admin - full access.")
+        return
+    if not REQUIRE_SUB:
+        await update.message.reply_text("✅ Open access - no subscription needed right now.")
+        return
+    exp = sub_expiry(uid)
+    if exp > time.time():
+        await update.message.reply_text(f"✅ Active until {fmt(exp)}.")
+    else:
+        ok, msg = await check_access(uid)
+        await update.message.reply_text(msg)
+
+
+# ------------------------------------------------------------ admin commands
+def admin_cmd(fn):
+    async def wrapper(update, context):
+        if update.effective_user.id not in ADMIN_IDS:
+            await update.message.reply_text("Admin only.")
+            return
+        await fn(update, context)
+    return wrapper
+
+
+@admin_cmd
+async def cmd_sync(update, context):
+    msg = await update.message.reply_text("⏳ Scanning R2...")
+    try:
+        added, removed, stories = await do_sync()
+    except Exception as e:
+        log.exception("sync failed")
+        await msg.edit_text(f"❌ Sync failed: {e}")
+        return
+    await msg.edit_text(f"✅ Done. New episodes: {added}, removed: {removed}, stories: {stories}.\nUse /stories to name new ones.")
+
+
+@admin_cmd
+async def cmd_stories(update, context):
+    with closing(db()) as con:
+        rows = con.execute(
+            "SELECT s.story_id, s.title, COUNT(e.key) c, MIN(e.modified) first, MAX(e.modified) last "
+            "FROM stories s LEFT JOIN episodes e ON e.story_id=s.story_id GROUP BY s.story_id ORDER BY s.story_id").fetchall()
+    if not rows:
+        await update.message.reply_text("No stories yet. Run /sync first.")
+        return
+    lines = [f"{r['story_id']}: {r['title'] or '(unnamed)'} - {r['c']} eps"
+             + (f" ({fmt(r['first'])} to {fmt(r['last'])})" if r["c"] else "") for r in rows]
+    await reply_long(update, "\n".join(lines))
+
+
+@admin_cmd
+async def cmd_name(update, context):
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /name <story id> <title>")
+        return
+    sid, title = int(context.args[0]), " ".join(context.args[1:]).strip()
+    with closing(db()) as con:
+        cur = con.execute("UPDATE stories SET title=? WHERE story_id=?", (title, sid))
+        con.commit()
+    await update.message.reply_text(f"✅ Story {sid} is now: {title}" if cur.rowcount else "Story id not found (run /sync).")
+
+
+@admin_cmd
+async def cmd_swap(update, context):
+    a = context.args
+    if len(a) != 3 or not all(x.isdigit() for x in a):
+        await update.message.reply_text("Usage: /swap <story id> <episode a> <episode b>")
+        return
+    sid, x, y = map(int, a)
+    with closing(db()) as con:
+        rx = con.execute("SELECT key FROM episodes WHERE story_id=? AND seq=?", (sid, x)).fetchone()
+        ry = con.execute("SELECT key FROM episodes WHERE story_id=? AND seq=?", (sid, y)).fetchone()
+        if not rx or not ry:
+            await update.message.reply_text("One of those episode numbers doesn't exist.")
+            return
+        con.execute("UPDATE episodes SET seq=-1 WHERE key=?", (rx["key"],))
+        con.execute("UPDATE episodes SET seq=? WHERE key=?", (x, ry["key"]))
+        con.execute("UPDATE episodes SET seq=? WHERE key=?", (y, rx["key"]))
+        con.commit()
+    await update.message.reply_text(f"✅ Swapped Ep {x} and Ep {y}.")
+
+
+@admin_cmd
+async def cmd_grant(update, context):
+    if len(context.args) != 2 or not context.args[0].isdigit() or not context.args[1].isdigit():
+        await update.message.reply_text("Usage: /grant <telegram id> <days>")
+        return
+    uid, days = int(context.args[0]), int(context.args[1])
+    new_exp = max(int(time.time()), sub_expiry(uid)) + days * 86400
+    with closing(db()) as con:
+        con.execute("INSERT OR REPLACE INTO subs(user_id, expires_at) VALUES(?,?)", (uid, new_exp))
+        con.commit()
+    await update.message.reply_text(f"✅ {uid} has access until {fmt(new_exp)}.")
+    try:
+        await context.bot.send_message(uid, f"✅ Your subscription is active until {fmt(new_exp)}. Send a series name to start.")
+    except Exception:
+        pass
+
+
+@admin_cmd
+async def cmd_revoke(update, context):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /revoke <telegram id>")
+        return
+    with closing(db()) as con:
+        cur = con.execute("DELETE FROM subs WHERE user_id=?", (int(context.args[0]),))
+        con.commit()
+    await update.message.reply_text("✅ Removed." if cur.rowcount else "Not found.")
+
+
+@admin_cmd
+async def cmd_subs(update, context):
+    with closing(db()) as con:
+        rows = con.execute("SELECT * FROM subs ORDER BY expires_at DESC").fetchall()
+    now = time.time()
+    await reply_long(update, "\n".join(f"{r['user_id']} - {'active' if r['expires_at'] > now else 'expired'} until {fmt(r['expires_at'])}"
+                                       for r in rows) or "No paid users yet.")
+
+
+@admin_cmd
+async def cmd_clearcache(update, context):
+    with closing(db()) as con:
+        con.execute("UPDATE episodes SET file_id=NULL, kind=NULL")
+        con.commit()
+    await update.message.reply_text("🧹 Cache cleared.")
+
+
+@admin_cmd
+async def cmd_stats(update, context):
+    with closing(db()) as con:
+        s = con.execute("SELECT COUNT(*) FROM stories").fetchone()[0]
+        n = con.execute("SELECT COUNT(*) FROM stories WHERE title IS NOT NULL").fetchone()[0]
+        e = con.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
+        a = con.execute("SELECT COUNT(*) FROM subs WHERE expires_at>?", (int(time.time()),)).fetchone()[0]
+    await update.message.reply_text(f"📊 Stories: {s} ({n} named)\nEpisodes: {e}\nActive paid users: {a}")
+
+
+# ------------------------------------------------------------ add episodes from the bot
+ADD_LOCK = asyncio.Lock()
+TG_DOWNLOAD_MAX = 20 * 1024 * 1024  # standard Bot API: bots can only download files up to 20 MB
+MIME_EXT = {"audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/mp4": ".m4a", "audio/x-m4a": ".m4a", "audio/aac": ".aac",
+            "audio/wav": ".wav", "audio/x-wav": ".wav", "audio/ogg": ".ogg", "audio/opus": ".opus",
+            "audio/webm": ".webm", "audio/flac": ".flac", "audio/x-flac": ".flac"}
+OK_EXT = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus", ".webm", ".flac"}
+
+
+@admin_cmd
+async def cmd_addto(update, context):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /addto <story id> [title]\nThen send the audio files. /done when finished.")
+        return
+    sid = int(context.args[0])
+    title = " ".join(context.args[1:]).strip()
+    with closing(db()) as con:
+        con.execute("INSERT OR IGNORE INTO stories(story_id, title) VALUES(?, NULL)", (sid,))
+        if title:
+            con.execute("UPDATE stories SET title=? WHERE story_id=?", (title, sid))
+        con.commit()
+        s = con.execute("SELECT title FROM stories WHERE story_id=?", (sid,)).fetchone()
+        n = con.execute("SELECT COALESCE(MAX(seq),0) FROM episodes WHERE story_id=?", (sid,)).fetchone()[0]
+    context.user_data["add_story"] = sid
+    await update.message.reply_text(
+        f"📥 Adding to story {sid}: {s['title'] or '(unnamed - use /name or /addto again with a title)'}\n"
+        f"Currently {n} episode(s). Send audio files now - next will be Ep {n + 1}.\n/done to stop.")
+
+
+@admin_cmd
+async def cmd_done(update, context):
+    sid = context.user_data.pop("add_story", None)
+    await update.message.reply_text("✅ Stopped adding." if sid else "Nothing was being added.")
+
+
+async def on_file(update, context):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    m = update.message
+    media = m.audio or m.document
+    if not media:
+        return
+    name = getattr(media, "file_name", None) or ""
+    ext = os.path.splitext(name)[1].lower() or MIME_EXT.get((media.mime_type or "").lower(), "")
+    if ext not in OK_EXT:
+        if m.audio:
+            ext = ".mp3"
+        else:
+            return  # some other document, ignore
+    # story: caption "<story id>" overrides the active /addto story
+    cap = (m.caption or "").strip()
+    sid = int(cap.split()[0]) if cap.split() and cap.split()[0].isdigit() else context.user_data.get("add_story")
+    if not sid:
+        await m.reply_text("Which story? Use /addto <story id> first, or put the story id as the file caption.")
+        return
+    if (media.file_size or 0) > TG_DOWNLOAD_MAX:
+        await m.reply_text(f"❌ {name or 'File'} is {media.file_size / 1048576:.1f} MB. Bots can only download up to 20 MB - "
+                           f"upload this one straight to R2 as audio/{sid}/<file>{ext} and run /sync.")
+        return
+    status = await m.reply_text("⏳ Uploading to R2...")
+    try:
+        f = await context.bot.get_file(media.file_id)
+        data = bytes(await f.download_as_bytearray())
+        key = f"audio/{sid}/{int(time.time())}_{media.file_unique_id}{ext}"
+        ctype = media.mime_type if (media.mime_type or "").startswith("audio/") else "audio/mpeg"
+        await asyncio.to_thread(lambda: s3.put_object(Bucket=R2_BUCKET, Key=key, Body=data, ContentType=ctype))
+        kind = "audio" if m.audio else "document"
+        async with ADD_LOCK:
+            with closing(db()) as con:
+                con.execute("INSERT OR IGNORE INTO stories(story_id, title) VALUES(?, NULL)", (sid,))
+                seq = con.execute("SELECT COALESCE(MAX(seq),0)+1 FROM episodes WHERE story_id=?", (sid,)).fetchone()[0]
+                con.execute("INSERT INTO episodes(key, story_id, seq, size, modified, file_id, kind) VALUES(?,?,?,?,?,?,?)",
+                            (key, sid, seq, len(data), int(time.time()), media.file_id, kind))
+                con.commit()
+                title = con.execute("SELECT title FROM stories WHERE story_id=?", (sid,)).fetchone()["title"]
+    except Exception as e:
+        log.exception("add episode failed")
+        await status.edit_text(f"❌ Failed: {e}")
+        return
+    note = f"✅ Added to story {sid} ({title or 'unnamed'}) as Ep {seq}"
+    if not title:
+        note += f"\n⚠️ Story has no name yet - /name {sid} <title> so users can search it."
+    await status.edit_text(note)
+
+
+# ------------------------------------------------------------ search & pick
+async def on_text(update, context):
+    if not await guard(update):
+        return
+    text = update.message.text.strip()
+    m = re.fullmatch(r"(\d+)\s*(?:-|–|to)\s*(\d+)|(\d+)", text)
+    if m:
+        sid = context.user_data.get("story_id")
+        if not sid:
+            await update.message.reply_text("First search for a series and tap it.")
+            return
+        lo, hi = (int(m.group(1)), int(m.group(2))) if m.group(1) else (int(m.group(3)),) * 2
+        await send_episodes(update, context, sid, min(lo, hi), max(lo, hi))
+        return
+    like = "%" + text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    with closing(db()) as con:
+        rows = con.execute(
+            "SELECT s.story_id, s.title, COUNT(e.key) c FROM stories s JOIN episodes e ON e.story_id=s.story_id "
+            "WHERE s.title LIKE ? ESCAPE '\\' GROUP BY s.story_id ORDER BY s.title LIMIT 15", (like,)).fetchall()
+    if not rows:
+        await update.message.reply_text("❌ No series found. Try another name.")
+        return
+    kb = [[InlineKeyboardButton(f"{r['title']} ({r['c']} eps)", callback_data=f"pick:{r['story_id']}")] for r in rows]
+    await update.message.reply_text("Select a series:", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def on_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    ok, msg = await check_access(q.from_user.id)
+    if not ok:
+        await q.message.reply_text(msg)
+        return
+    action, _, val = q.data.partition(":")
+    if action != "pick":
+        return
+    with closing(db()) as con:
+        s = con.execute("SELECT * FROM stories WHERE story_id=?", (int(val),)).fetchone()
+        c = con.execute("SELECT COUNT(*) n, MIN(seq) lo, MAX(seq) hi FROM episodes WHERE story_id=?", (int(val),)).fetchone()
+    if not s or not c["n"]:
+        await q.edit_message_text("Series not found.")
+        return
+    context.user_data["story_id"] = int(val)
+    lo, hi = c["lo"], c["hi"]
+    await q.edit_message_text(
+        f"📺 {s['title']}\nTotal episodes: {c['n']} (Ep {lo} - {hi})\n\n"
+        f"Send an episode number (e.g. {hi}) or a range (e.g. {lo}-{min(lo + 19, hi)}).")
+
+
+# ------------------------------------------------------------ sending
+async def send_one(context, chat_id, ep, title):
+    seq = ep["seq"]
+    caption = f"{title} - Ep {seq}"
+    if ep["file_id"]:
+        try:
+            if ep["kind"] == "audio":
+                return await context.bot.send_audio(chat_id, audio=ep["file_id"], title=caption, protect_content=True), None
+            return await context.bot.send_document(chat_id, document=ep["file_id"], caption=caption, protect_content=True), None
+        except Exception as e:
+            log.warning("cached file_id failed for %s: %s", ep["key"], e)
+    if ep["size"] > TG_MAX_BYTES:
+        return None, f"Ep {seq}: file is too large for Telegram bots"
+    data = await asyncio.to_thread(r2_get, ep["key"])
+    ext = os.path.splitext(ep["key"])[1] or ".mp3"
+    fname = re.sub(r'[\\/:*?"<>|]', "", f"{caption}{ext}")
+    try:
+        msg = await context.bot.send_audio(chat_id, audio=InputFile(io.BytesIO(data), filename=fname),
+                                           title=caption, protect_content=True)
+        kind, fid = "audio", msg.audio.file_id
+    except Exception as e:
+        log.warning("send_audio failed (%s), trying document", e)
+        msg = await context.bot.send_document(chat_id, document=InputFile(io.BytesIO(data), filename=fname),
+                                              caption=caption, protect_content=True)
+        kind, fid = "document", msg.document.file_id
+    with closing(db()) as con:
+        con.execute("UPDATE episodes SET file_id=?, kind=? WHERE key=?", (fid, kind, ep["key"]))
+        con.commit()
+    return msg, None
+
+
+async def send_episodes(update, context, story_id, lo, hi):
+    chat_id = update.effective_chat.id
+    if hi - lo + 1 > MAX_RANGE:
+        await update.message.reply_text(f"Please request at most {MAX_RANGE} episodes at a time.")
+        return
+    with closing(db()) as con:
+        s = con.execute("SELECT title FROM stories WHERE story_id=?", (story_id,)).fetchone()
+        eps = [dict(r) for r in con.execute(
+            "SELECT * FROM episodes WHERE story_id=? AND seq BETWEEN ? AND ? ORDER BY seq", (story_id, lo, hi))]
+    if not eps:
+        await update.message.reply_text("No episodes found in that range.")
+        return
+    status = await update.message.reply_text(f"⏳ Preparing {len(eps)} episode(s)...")
+    sent, errors = 0, []
+    for ep in eps:
+        ok, _ = await check_access(update.effective_user.id)  # access can't outlive the subscription mid-request
+        if not ok:
+            errors.append("Subscription ended")
+            break
+        try:
+            msg, err = await send_one(context, chat_id, ep, s["title"])
+        except Exception as e:
+            log.error("send failed %s: %s", ep["key"], e)
+            msg, err = None, f"Ep {ep['seq']}: could not send"
+        if err:
+            errors.append(err)
+            continue
+        sent += 1
+        if DELETE_AFTER > 0:
+            context.job_queue.run_once(delete_job, DELETE_AFTER, data={"chat_id": chat_id, "message_id": msg.message_id})
+    try:
+        await status.delete()
+    except Exception:
+        pass
+    note = f"✅ Sent {sent} episode(s)."
+    if sent and DELETE_AFTER > 0:
+        note += f"\n🗑 They will be deleted in {max(DELETE_AFTER // 60, 1)} min."
+    if errors:
+        note += "\n⚠️ " + "\n⚠️ ".join(errors[:10])
+    await update.message.reply_text(note)
+
+
+# ------------------------------------------------------------ main
+def main():
+    if not ADMIN_IDS:
+        raise SystemExit("Set ADMIN_IDS in .env (your Telegram user id).")
+    init_db()
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    priv = filters.ChatType.PRIVATE
+    for name, fn in [("start", cmd_start), ("help", cmd_help), ("status", cmd_status), ("sync", cmd_sync),
+                     ("stories", cmd_stories), ("name", cmd_name), ("swap", cmd_swap), ("grant", cmd_grant),
+                     ("revoke", cmd_revoke), ("subs", cmd_subs), ("clearcache", cmd_clearcache), ("stats", cmd_stats),
+                     ("addto", cmd_addto), ("done", cmd_done)]:
+        app.add_handler(CommandHandler(name, fn, filters=priv))
+    app.add_handler(MessageHandler((filters.AUDIO | filters.Document.ALL) & priv, on_file))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & priv, on_text))
+    log.info("Bot started")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
