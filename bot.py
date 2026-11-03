@@ -63,6 +63,9 @@ def init_db():
             key TEXT PRIMARY KEY, story_id INTEGER NOT NULL, seq INTEGER NOT NULL,
             size INTEGER NOT NULL, modified INTEGER NOT NULL, file_id TEXT, kind TEXT,
             UNIQUE(story_id, seq));
+        CREATE TABLE IF NOT EXISTS requests(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, username TEXT,
+            text TEXT NOT NULL, created INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
         """)
         con.commit()
 
@@ -141,6 +144,8 @@ def help_text(is_admin):
         "1. Type a series name to search.\n"
         "2. Tap the series - you'll see how many episodes it has.\n"
         "3. Send an episode number (350) or a range (350-370).\n\n"
+        "/list - browse all available series\n"
+        "/request <name> - ask for a series that isn't here\n\n"
         f"Episodes are protected and auto-delete after {max(DELETE_AFTER // 60, 1)} min - listen or save quickly.\n\n"
         "/start - welcome\n/help - this message\n/status - your subscription"
     )
@@ -157,6 +162,8 @@ def help_text(is_admin):
             "/revoke <telegram id> - remove access\n"
             "/subs - list paid users\n"
             "/clearcache - forget cached Telegram files\n"
+            "/requests - pending user requests\n"
+            "/reqdone <request id> - mark a request as added (notifies the user)\n"
             "/stats\n\nAdmins don't need a subscription."
         )
     return t
@@ -409,6 +416,101 @@ async def on_file(update, context):
     await status.edit_text(note)
 
 
+# ------------------------------------------------------------ browse & request
+LIST_PAGE = 10
+REQ_PER_DAY = 5
+
+
+def list_page(page):
+    with closing(db()) as con:
+        rows = con.execute(
+            "SELECT s.story_id, s.title, COUNT(e.key) c FROM stories s JOIN episodes e ON e.story_id=s.story_id "
+            "WHERE s.title IS NOT NULL AND s.title<>'' GROUP BY s.story_id ORDER BY s.title COLLATE NOCASE").fetchall()
+    if not rows:
+        return None
+    pages = (len(rows) + LIST_PAGE - 1) // LIST_PAGE
+    page = max(0, min(page, pages - 1))
+    chunk = rows[page * LIST_PAGE:(page + 1) * LIST_PAGE]
+    kb = [[InlineKeyboardButton(f"{r['title']} ({r['c']} eps)", callback_data=f"pick:{r['story_id']}")] for r in chunk]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"list:{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data=f"list:{page}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("Next ▶", callback_data=f"list:{page + 1}"))
+    kb.append(nav)
+    return f"📚 Available series ({len(rows)}) - tap one:\nCan't find yours? /request <name>", InlineKeyboardMarkup(kb)
+
+
+async def cmd_list(update, context):
+    if not await guard(update):
+        return
+    data = list_page(0)
+    if not data:
+        await update.message.reply_text("No series available yet.")
+        return
+    await update.message.reply_text(data[0], reply_markup=data[1])
+
+
+async def cmd_request(update, context):
+    if not await guard(update):
+        return
+    text = " ".join(context.args).strip()[:200]
+    if not text:
+        await update.message.reply_text("Usage: /request <series name>\nExample: /request Mera Naam Joker")
+        return
+    u = update.effective_user
+    now = int(time.time())
+    with closing(db()) as con:
+        n = con.execute("SELECT COUNT(*) FROM requests WHERE user_id=? AND created>?", (u.id, now - 86400)).fetchone()[0]
+        if n >= REQ_PER_DAY:
+            await update.message.reply_text(f"You can send up to {REQ_PER_DAY} requests per day. Try again tomorrow.")
+            return
+        cur = con.execute("INSERT INTO requests(user_id, username, text, created) VALUES(?,?,?,?)",
+                          (u.id, u.username, text, now))
+        con.commit()
+        rid = cur.lastrowid
+    await update.message.reply_text(f"✅ Request #{rid} sent: {text}\nWe'll notify you here when it's added.")
+    who = f"{u.full_name} (@{u.username})" if u.username else u.full_name
+    for aid in ADMIN_IDS:
+        try:
+            await context.bot.send_message(aid, f"📩 Request #{rid} from {who}, id {u.id}:\n{text}\n\n/reqdone {rid} once added")
+        except Exception as e:
+            log.warning("could not notify admin %s: %s", aid, e)
+
+
+@admin_cmd
+async def cmd_requests(update, context):
+    with closing(db()) as con:
+        rows = con.execute("SELECT * FROM requests WHERE status='pending' ORDER BY id DESC LIMIT 40").fetchall()
+    if not rows:
+        await update.message.reply_text("No pending requests.")
+        return
+    await reply_long(update, "\n".join(f"#{r['id']} - {r['text']} ({fmt(r['created'])}, user {r['user_id']})" for r in rows)
+                     + "\n\n/reqdone <id> when added")
+
+
+@admin_cmd
+async def cmd_reqdone(update, context):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /reqdone <request id>")
+        return
+    rid = int(context.args[0])
+    with closing(db()) as con:
+        r = con.execute("SELECT * FROM requests WHERE id=?", (rid,)).fetchone()
+        if not r:
+            await update.message.reply_text("Request not found.")
+            return
+        con.execute("UPDATE requests SET status='done' WHERE id=?", (rid,))
+        con.commit()
+    try:
+        await context.bot.send_message(r["user_id"], f"✅ Your requested series \"{r['text']}\" has been added! Search for it or use /list.")
+        extra = " User notified."
+    except Exception:
+        extra = " (Could not notify the user - they may have blocked the bot.)"
+    await update.message.reply_text(f"✅ Request #{rid} marked done.{extra}")
+
+
 # ------------------------------------------------------------ search & pick
 async def on_text(update, context):
     if not await guard(update):
@@ -429,7 +531,7 @@ async def on_text(update, context):
             "SELECT s.story_id, s.title, COUNT(e.key) c FROM stories s JOIN episodes e ON e.story_id=s.story_id "
             "WHERE s.title LIKE ? ESCAPE '\\' GROUP BY s.story_id ORDER BY s.title LIMIT 15", (like,)).fetchall()
     if not rows:
-        await update.message.reply_text("❌ No series found. Try another name.")
+        await update.message.reply_text("❌ No series found. Try another name, browse with /list, or ask for it with /request <name>.")
         return
     kb = [[InlineKeyboardButton(f"{r['title']} ({r['c']} eps)", callback_data=f"pick:{r['story_id']}")] for r in rows]
     await update.message.reply_text("Select a series:", reply_markup=InlineKeyboardMarkup(kb))
@@ -443,6 +545,14 @@ async def on_callback(update, context):
         await q.message.reply_text(msg)
         return
     action, _, val = q.data.partition(":")
+    if action == "list":
+        data = list_page(int(val))
+        if data:
+            try:
+                await q.edit_message_text(data[0], reply_markup=data[1])
+            except Exception:
+                pass  # same page tapped again
+        return
     if action != "pick":
         return
     with closing(db()) as con:
@@ -541,7 +651,8 @@ def main():
     for name, fn in [("start", cmd_start), ("help", cmd_help), ("status", cmd_status), ("sync", cmd_sync),
                      ("stories", cmd_stories), ("name", cmd_name), ("swap", cmd_swap), ("grant", cmd_grant),
                      ("revoke", cmd_revoke), ("subs", cmd_subs), ("clearcache", cmd_clearcache), ("stats", cmd_stats),
-                     ("addto", cmd_addto), ("done", cmd_done)]:
+                     ("addto", cmd_addto), ("done", cmd_done),
+                     ("list", cmd_list), ("request", cmd_request), ("requests", cmd_requests), ("reqdone", cmd_reqdone)]:
         app.add_handler(CommandHandler(name, fn, filters=priv))
     app.add_handler(MessageHandler((filters.AUDIO | filters.Document.ALL) & priv, on_file))
     app.add_handler(CallbackQueryHandler(on_callback))
