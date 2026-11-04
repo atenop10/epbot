@@ -204,11 +204,12 @@ async def player(request):
     new_exp = int(time.time()) + SESSION_SECONDS
     prev_url = f"/p/{make_token(uid, sid, seq - 1, new_exp)}" if has_prev else ""
     next_url = f"/p/{make_token(uid, sid, seq + 1, new_exp)}" if has_next else ""
+    test = bool(request.query.get("adtest"))
     page = (PLAYER.replace("@@TITLE@@", html.escape(title)).replace("@@SEQ@@", str(seq)).replace("@@SID@@", str(sid))
             .replace("@@TOK@@", tok).replace("@@EXP@@", str(SESSION_SECONDS // 60)).replace("@@NEXT@@", next_url)
             .replace("@@PREV@@", f'<a href="{prev_url}">◀ Prev</a>' if prev_url else "<span>◀ Prev</span>")
-            .replace("@@ADH@@", str(AD_HEIGHT))
-            .replace("@@AD@@", (f'<div class=ad><small>Advertisement</small><iframe src="/ad/{tok}" loading=lazy '
+            .replace("@@ADH@@", str(AD_HEIGHT + (90 if test else 0)))
+            .replace("@@AD@@", (f'<div class=ad><small>Advertisement</small><iframe src="/ad/{tok}{"?test=1" if test else ""}" loading=lazy '
                                 'sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" '
                                 'referrerpolicy="origin"></iframe></div>') if ad_html() else "")
             .replace("@@NEXTLINK@@", f'<a href="{next_url}">Next ▶</a>' if next_url else "<span>Next ▶</span>"))
@@ -230,8 +231,18 @@ async def ad_frame(request):
     code = ad_html()
     if not code:
         return web.Response(status=204)
+    dbg = ""
+    if request.query.get("test"):  # diagnostic mode (/adtest in the bot): says what the ad network did
+        dbg = ("<div id=dbg style=\"position:fixed;left:0;right:0;bottom:0;padding:4px 6px;font:12px system-ui;color:#9aa0aa;"
+               "text-align:center;background:#0f1115\">Ad frame loaded. Waiting for the ad network...</div><script>(function(){"
+               "var d=document.getElementById('dbg'),bad=0;"
+               "window.addEventListener('error',function(e){var t=e.target;if(t&&t.tagName==='SCRIPT'){bad=1;"
+               "d.textContent='FAILED to load '+(t.src||'a script')+' - blocked by an ad blocker / DNS / network, or that domain is down'}},true);"
+               "setTimeout(function(){if(bad)return;var n=document.querySelectorAll('iframe,img,ins,video,canvas').length;"
+               "d.textContent=n?'Ad network drew '+n+' element(s). If the box above is still empty: no ad to show (no fill / site not approved yet).'"
+               ":'Ad script loaded but drew nothing: the network is not serving this site (not approved yet, no fill, or it refuses sandboxed frames).'},5000)})();</script>")
     page = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<style>html,body{margin:0;background:transparent;display:flex;justify-content:center}</style>" + code)
+            "<style>html,body{margin:0;background:transparent;display:flex;justify-content:center}</style>" + dbg + code)
     return web.Response(text=page, content_type="text/html", headers={
         "Cache-Control": "no-store", "X-Robots-Tag": "noindex",
         # opaque origin: no cookies, no access to the parent page or the audio, popups allowed for ad clicks

@@ -30,6 +30,23 @@ From Telegram, as admin:
 
 Or edit `ad.html` in the bot folder directly (no restart needed; it is re-read when the file changes).
 
+## Ads not showing? Use /adtest
+
+Send `/adtest` to the bot (admin). It checks the player, the ad file, the box height and your storage mode, then
+gives a **test link**. Open it on your phone: under the ad box a line tells you what the ad network did:
+
+- "FAILED to load ... bauval.org" - the ad script is blocked (ad blocker, DNS/ISP filter) or the ad domain is down.
+- "Ad script loaded but drew nothing" - the network is not serving your site (not approved yet, no fill).
+- "Ad network drew N element(s)" - it works; an empty box then just means no ad was available right now.
+
+Most common reasons ads never appear:
+1. Episodes are stored in the **Telegram channel** (`STORAGE_CHANNEL_ID` set). Those are sent as files, not through
+   the player, so there is no ad. Only R2 episodes open the web player.
+2. Streaming player not enabled (`STREAM_BASE_URL` / `STREAM_SECRET` empty) or the bot was not restarted.
+3. `ad.html` missing or empty in the bot folder (the "Advertisement" label does not appear at all then).
+4. Your ad network account has not approved the player domain yet.
+5. Ad blocker / Telegram in-app browser. Test in Chrome without extensions.
+
 ## Settings (.env)
 
 | Setting | Meaning |

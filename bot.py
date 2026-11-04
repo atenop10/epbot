@@ -226,6 +226,7 @@ def help_text(is_admin):
             "/clearcache - forget cached Telegram files\n"
             "/forcesub - check the force-join channel setup\n"
             "/setad <ad code> - show an ad on the player page (/setad off to remove)\n"
+            "/adtest - check why the ad is not showing (gives a test link)\n"
             "/requests - pending user requests\n"
             "/reqdone <request id> - mark a request as added (notifies the user)\n"
             "/stats\n\nAdmins don't need a subscription."
@@ -580,6 +581,28 @@ async def cmd_setad(update, context):
     except Exception as e:
         log.exception("setad failed")
         await update.message.reply_text(f"❌ Could not save: {e}")
+
+
+@admin_cmd
+async def cmd_adtest(update, context):
+    code = stream.ad_html()
+    lines = ["📢 Ad check",
+             "Player: " + ("ON" if stream.ENABLED else "OFF - STREAM_BASE_URL / STREAM_SECRET are missing in .env, so there is no player and no ad"),
+             "Ad file: " + os.path.abspath(stream.AD_FILE) + (f" - found, {len(code)} characters" if code else " - MISSING or EMPTY (use /setad or put the code in this file)"),
+             f"Ad box height: {stream.AD_HEIGHT}px (60 for 320x50, 280 for 300x250)",
+             "Storage for new uploads: " + ("Telegram channel - those episodes are sent as files and NEVER show ads (ads only appear on the R2 player)" if STORAGE_CHANNEL else "R2 - good")]
+    if not stream.ENABLED or not code:
+        await update.message.reply_text("\n".join(lines))
+        return
+    with closing(db()) as con:
+        ep = con.execute("SELECT story_id, seq FROM episodes WHERE key NOT LIKE 'tg/%' ORDER BY story_id, seq LIMIT 1").fetchone()
+    if not ep:
+        lines.append("\nNo R2 episode in the database, so there is nothing the player can open. Run /sync.")
+        await update.message.reply_text("\n".join(lines))
+        return
+    url = stream.url_for(update.effective_user.id, ep["story_id"], ep["seq"], int(time.time()) + 900) + "?adtest=1"
+    lines.append("\nOpen this test link in your phone browser (valid 15 min). The text under the ad box tells what the ad network did:\n" + url)
+    await update.message.reply_text("\n".join(lines), disable_web_page_preview=True)
 
 
 @admin_cmd
@@ -1093,7 +1116,7 @@ def main():
                      ("stories", cmd_stories), ("name", cmd_name), ("swap", cmd_swap), ("grant", cmd_grant),
                      ("revoke", cmd_revoke), ("subs", cmd_subs), ("clearcache", cmd_clearcache), ("stats", cmd_stats),
                      ("addto", cmd_addto), ("done", cmd_done), ("delete", cmd_delete), ("renumber", cmd_renumber),
-                     ("forcesub", cmd_forcesub), ("setad", cmd_setad), ("list", cmd_list), ("request", cmd_request), ("requests", cmd_requests), ("reqdone", cmd_reqdone)]:
+                     ("forcesub", cmd_forcesub), ("setad", cmd_setad), ("adtest", cmd_adtest), ("list", cmd_list), ("request", cmd_request), ("requests", cmd_requests), ("reqdone", cmd_reqdone)]:
         app.add_handler(CommandHandler(name, fn, filters=priv))
     app.add_handler(MessageHandler((filters.AUDIO | filters.Document.ALL) & priv, on_file))
     app.add_handler(CallbackQueryHandler(on_callback))
