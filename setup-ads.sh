@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Turns on the ad banner on the streaming player.
-# Run from the bot folder:   bash setup-ads.sh [ad_height]      (default 60 = 320x50 banner; use 280 for 300x250)
+# Run from the bot folder:   bash setup-ads.sh [ad_height]      (default 280 = 300x250 banner; use 60 for 320x50)
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
-H="${1:-60}"
+H="${1:-280}"
 SERVICE="episodes-bot"
 
 [ -f "$DIR/.env" ]    || { echo "No .env in $DIR - run setup.sh first."; exit 1; }

@@ -30,6 +30,7 @@ PORT = int(os.environ.get("STREAM_PORT", "8080"))
 RATE = max(int(os.environ.get("STREAM_RATE_KBPS", "80")), 16) * 1024   # bytes/second after the initial burst
 MAX_DEVICES = max(int(os.environ.get("STREAM_MAX_DEVICES", "2")), 1)    # browsers that may use one link
 SESSION_SECONDS = int(os.environ.get("STREAM_SESSION_MIN", "90")) * 60  # lifetime of prev/next links
+HEAD_FILE = os.environ.get("STREAM_HEAD_FILE", "head_tags.html")  # site-verification tags (Monetag etc.), put in <head>
 AD_FILE = os.environ.get("STREAM_AD_FILE", "ad.html")        # ad network code (set with /setad in the bot)
 AD_HEIGHT = int(os.environ.get("STREAM_AD_HEIGHT", "280"))    # 280 fits a 300x250 banner, use 60 for 320x50
 BURST = 1_000_000   # bytes sent at full speed so playback starts instantly
@@ -53,6 +54,21 @@ def ad_html():
             with open(AD_FILE, encoding="utf-8") as f:
                 _ad_cache.update(mtime=mtime, html=f.read().strip())
         return _ad_cache["html"]
+    except OSError:
+        return ""
+
+
+_head_cache = {"mtime": None, "html": ""}
+
+
+def head_html():
+    """Extra tags for <head> (e.g. <meta name="monetag" ...>). Empty string if the file does not exist."""
+    try:
+        mtime = os.stat(HEAD_FILE).st_mtime
+        if _head_cache["mtime"] != mtime:
+            with open(HEAD_FILE, encoding="utf-8") as f:
+                _head_cache.update(mtime=mtime, html=f.read().strip())
+        return _head_cache["html"]
     except OSError:
         return ""
 
@@ -141,10 +157,20 @@ async def _authorize(tok):
     return info, None
 
 
+# ------------------------------------------------------------ home page (needed for ad-network site verification)
+async def home(request):
+    page = ("<!doctype html><html lang=en><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>" + head_html() +
+            "<title>Audio player</title></head><body style=\"font-family:system-ui;background:#0f1115;color:#e8e8ea;"
+            "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;text-align:center\">"
+            "<div><h2>\U0001F3A7</h2><p>Open an episode from the Telegram bot to listen.</p></div></body></html>")
+    return web.Response(text=page, content_type="text/html", headers={"Cache-Control": "no-cache"})
+
+
 # ------------------------------------------------------------ player page
 PLAYER = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><meta name=robots content=noindex>
-<meta name=referrer content=no-referrer><title>@@TITLE@@ - Ep @@SEQ@@</title><style>
+<meta name=referrer content=no-referrer>@@HEAD@@<title>@@TITLE@@ - Ep @@SEQ@@</title><style>
 *{box-sizing:border-box}body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
 background:#0f1115;color:#e8e8ea;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;-webkit-user-select:none;user-select:none}
 main{width:100%;max-width:420px;padding:28px 22px;text-align:center}
@@ -205,13 +231,17 @@ async def player(request):
     prev_url = f"/p/{make_token(uid, sid, seq - 1, new_exp)}" if has_prev else ""
     next_url = f"/p/{make_token(uid, sid, seq + 1, new_exp)}" if has_next else ""
     test = bool(request.query.get("adtest"))
+    nosb = test and bool(request.query.get("nosb"))   # TEST ONLY: ad frame without sandbox (see /adtest)
+    ad_src = f"/ad/{tok}" + (("?test=1&amp;nosb=1" if nosb else "?test=1") if test else "")
+    sb = "" if nosb else ' sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"'
+    ad_block = (f'<div class=ad><small>Advertisement</small><iframe src="{ad_src}" loading=lazy{sb} '
+                'referrerpolicy="origin"></iframe></div>') if ad_html() else ""
     page = (PLAYER.replace("@@TITLE@@", html.escape(title)).replace("@@SEQ@@", str(seq)).replace("@@SID@@", str(sid))
             .replace("@@TOK@@", tok).replace("@@EXP@@", str(SESSION_SECONDS // 60)).replace("@@NEXT@@", next_url)
             .replace("@@PREV@@", f'<a href="{prev_url}">◀ Prev</a>' if prev_url else "<span>◀ Prev</span>")
             .replace("@@ADH@@", str(AD_HEIGHT + (90 if test else 0)))
-            .replace("@@AD@@", (f'<div class=ad><small>Advertisement</small><iframe src="/ad/{tok}{"?test=1" if test else ""}" loading=lazy '
-                                'sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" '
-                                'referrerpolicy="origin"></iframe></div>') if ad_html() else "")
+            .replace("@@HEAD@@", head_html())
+            .replace("@@AD@@", ad_block)
             .replace("@@NEXTLINK@@", f'<a href="{next_url}">Next ▶</a>' if next_url else "<span>Next ▶</span>"))
     resp = web.Response(text=page, content_type="text/html", headers={
         "Cache-Control": "no-store", "X-Robots-Tag": "noindex", "X-Content-Type-Options": "nosniff",
@@ -238,16 +268,18 @@ async def ad_frame(request):
                "var d=document.getElementById('dbg'),bad=0;"
                "window.addEventListener('error',function(e){var t=e.target;if(t&&t.tagName==='SCRIPT'){bad=1;"
                "d.textContent='FAILED to load '+(t.src||'a script')+' - blocked by an ad blocker / DNS / network, or that domain is down'}},true);"
-               "setTimeout(function(){if(bad)return;var n=document.querySelectorAll('iframe,img,ins,video,canvas').length;"
-               "d.textContent=n?'Ad network drew '+n+' element(s). If the box above is still empty: no ad to show (no fill / site not approved yet).'"
+               "setTimeout(function(){if(bad)return;var l=document.querySelectorAll('iframe,img,ins,video,canvas'),n=l.length,h=[];"
+               "for(var i=0;i<l.length;i++){var u=l[i].src||'';try{h.push(l[i].tagName.toLowerCase()+' from '+(new URL(u,location.href)).host)}catch(x){h.push(l[i].tagName.toLowerCase())}}"
+               "d.textContent=n?'Ad network drew '+n+' element(s): '+h.join(', ')+'. If the box above is still empty: no ad to show (no fill / site not approved yet).'"
                ":'Ad script loaded but drew nothing: the network is not serving this site (not approved yet, no fill, or it refuses sandboxed frames).'},5000)})();</script>")
     page = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
             "<style>html,body{margin:0;background:transparent;display:flex;justify-content:center}</style>" + dbg + code)
     return web.Response(text=page, content_type="text/html", headers={
         "Cache-Control": "no-store", "X-Robots-Tag": "noindex",
         # opaque origin: no cookies, no access to the parent page or the audio, popups allowed for ad clicks
-        "Content-Security-Policy": "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox; "
-                                   "default-src * data: blob: 'unsafe-inline' 'unsafe-eval'"})
+        "Content-Security-Policy": ("" if (request.query.get("test") and request.query.get("nosb"))
+                                    else "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox; ")
+                                   + "default-src * data: blob: 'unsafe-inline' 'unsafe-eval'"})
 
 
 # ------------------------------------------------------------ audio (throttled, range-capable)
@@ -313,6 +345,7 @@ async def start(_application=None):
     # many listeners at once: give blocking R2 reads plenty of worker threads (the default is only a handful)
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=64))
     app = web.Application()
+    app.router.add_get("/", home)
     app.router.add_get("/p/{tok}", player)
     app.router.add_get("/a/{tok}", audio)
     app.router.add_get("/ad/{tok}", ad_frame)
