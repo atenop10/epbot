@@ -18,7 +18,7 @@ import boto3
 from botocore.config import Config
 
 import stream
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MenuButtonWebApp, Update, WebAppInfo
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters,
 )
@@ -51,6 +51,7 @@ for _raw in os.environ.get("FORCE_SUB_CHANNELS", "").split(","):
     if not _link and isinstance(_chat, str):
         _link = f"https://t.me/{_chat[1:]}"
     FORCE_SUB.append((_chat, _link))
+BOT_APP = None  # the running telegram Application (set at startup; the Mini App API uses it to send messages)
 FSUB_CACHE, FSUB_TTL = {}, 600  # a user who passed the check is trusted for 10 minutes
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
@@ -204,6 +205,7 @@ def help_text(is_admin):
         "1. Type a series name to search.\n"
         "2. Tap the series - you'll see how many episodes it has.\n"
         "3. Send an episode number (350) or a range (350-370).\n\n"
+        "/app - open the app (search, browse, listen)\n"
         "/list - browse all available series\n"
         "/request <name> - ask for a series that isn't here\n\n"
         f"Episodes are protected and auto-delete after {max(DELETE_AFTER // 60, 1)} min - listen or save quickly.\n\n"
@@ -252,7 +254,26 @@ async def reply_long(update, text):
 async def cmd_start(update, context):
     if not await guard(update):
         return
-    await update.message.reply_text("Welcome to AUDIOS FM! Send a series name to search. /help for instructions.")
+    kb = app_button()
+    await update.message.reply_text("Welcome to AUDIOS FM! Tap Open app to browse and listen, or just send a series name to search. /help for instructions.",
+                                    reply_markup=kb)
+
+
+def app_button():
+    """Inline button that opens the Mini App (None if the streaming server / domain is not set up)."""
+    if not stream.ENABLED:
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🎧 Open app", web_app=WebAppInfo(url=stream.BASE_URL + "/app"))]])
+
+
+async def cmd_app(update, context):
+    if not await guard(update):
+        return
+    kb = app_button()
+    if not kb:
+        await update.message.reply_text("The app is not set up yet (streaming player is off).")
+        return
+    await update.message.reply_text("🎧 Tap to open the app:", reply_markup=kb)
 
 
 async def cmd_help(update, context):
@@ -1136,19 +1157,98 @@ async def send_episodes(update, context, story_id, lo, hi):
     await update.message.reply_text(note)
 
 
+# ------------------------------------------------------------ Mini App support (called from miniapp.py via stream.CTX)
+class _Ctx:
+    """Minimal stand-in for the handler context: send_one only needs .bot."""
+    def __init__(self, bot):
+        self.bot = bot
+
+
+async def api_gate(uid):
+    ok, msg = await check_access(uid)
+    if not ok:
+        return {"ok": False, "msg": msg, "links": []}
+    miss = await missing_channels(BOT_APP.bot, uid)
+    if miss:
+        return {"ok": False, "msg": "🔒 Please join our channel first, then tap Try again.", "links": [l for _, l in miss if l]}
+    return {"ok": True}
+
+
+async def api_send(uid, sid, seq):
+    """Mini App 'send to chat' for episodes that are stored in Telegram (cannot be streamed)."""
+    with closing(db()) as con:
+        ep = con.execute("SELECT * FROM episodes WHERE story_id=? AND seq=?", (sid, seq)).fetchone()
+        s = con.execute("SELECT title FROM stories WHERE story_id=?", (sid,)).fetchone()
+    if not ep:
+        return False, "Episode not found."
+    ep = dict(ep)
+    title = s["title"] if s and s["title"] else f"Story {sid}"
+    try:
+        msg, err = await send_one(_Ctx(BOT_APP.bot), uid, ep, title)
+    except Exception as e:
+        log.error("app send failed %s: %s", ep["key"], e)
+        return False, "Could not send. Open the bot chat, send /start, then try again."
+    if err:
+        return False, err
+    try:
+        with closing(db()) as con:
+            con.execute("INSERT INTO plays(user_id, story_id, seq, ts) VALUES(?,?,?,?)", (uid, sid, seq, int(time.time())))
+            con.commit()
+    except Exception as e:
+        log.warning("play log failed: %s", e)
+    if DELETE_AFTER > 0:
+        BOT_APP.job_queue.run_once(delete_job, DELETE_AFTER, data={"chat_id": uid, "message_id": msg.message_id})
+    return True, "✅ Sent to your chat." + (f" It will be deleted in {max(DELETE_AFTER // 60, 1)} min." if DELETE_AFTER > 0 else "")
+
+
+async def api_request(user, text):
+    """Mini App 'request this series' (same rules as /request)."""
+    uid = user["id"]
+    username = user.get("username")
+    full = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x) or str(uid)
+    now = int(time.time())
+    with closing(db()) as con:
+        n = con.execute("SELECT COUNT(*) FROM requests WHERE user_id=? AND created>?", (uid, now - 86400)).fetchone()[0]
+        if n >= REQ_PER_DAY:
+            return False, f"You can send up to {REQ_PER_DAY} requests per day. Try again tomorrow."
+        cur = con.execute("INSERT INTO requests(user_id, username, text, created) VALUES(?,?,?,?)", (uid, username, text, now))
+        con.commit()
+        rid = cur.lastrowid
+    who = f"{full} (@{username})" if username else full
+    for aid in ADMIN_IDS:
+        try:
+            await BOT_APP.bot.send_message(aid, f"📩 Request #{rid} from {who}, id {uid}:\n{text}\n\n/reqdone {rid} once added")
+        except Exception as e:
+            log.warning("could not notify admin %s: %s", aid, e)
+    return True, f"✅ Request #{rid} sent. We'll notify you in the bot when it's added."
+
+
+async def on_start(application):
+    """Start the web server (player + Mini App) and put an 'Open app' button in every chat's menu."""
+    global BOT_APP
+    BOT_APP = application
+    await stream.start(application)
+    try:
+        await application.bot.set_chat_menu_button(
+            menu_button=MenuButtonWebApp(text="🎧 Open app", web_app=WebAppInfo(url=stream.BASE_URL + "/app")))
+    except Exception as e:
+        log.warning("could not set the menu button: %s", e)
+
+
 # ------------------------------------------------------------ main
 def main():
     if not ADMIN_IDS:
         raise SystemExit("Set ADMIN_IDS in .env (your Telegram user id).")
     init_db()
     stream.configure(db, s3, R2_BUCKET, check_access)
+    stream.CTX.update(gate=api_gate, send=api_send, request=api_request)
     builder = Application.builder().token(BOT_TOKEN).concurrent_updates(True)
     if stream.ENABLED:
-        builder = builder.post_init(stream.start).post_shutdown(stream.stop)
+        builder = builder.post_init(on_start).post_shutdown(stream.stop)
     app = builder.build()
     priv = filters.ChatType.PRIVATE
     app.add_handler(TypeHandler(Update, track_user), group=-1)
-    for name, fn in [("start", cmd_start), ("help", cmd_help), ("status", cmd_status), ("sync", cmd_sync),
+    for name, fn in [("start", cmd_start), ("app", cmd_app), ("help", cmd_help), ("status", cmd_status), ("sync", cmd_sync),
                      ("stories", cmd_stories), ("name", cmd_name), ("swap", cmd_swap), ("grant", cmd_grant),
                      ("revoke", cmd_revoke), ("subs", cmd_subs), ("clearcache", cmd_clearcache), ("stats", cmd_stats),
                      ("addto", cmd_addto), ("done", cmd_done), ("delete", cmd_delete), ("renumber", cmd_renumber),

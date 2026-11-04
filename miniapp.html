@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="robots" content="noindex"><meta name="referrer" content="no-referrer">
+@@HEAD@@
+<title>AUDIOS FM</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg:var(--tg-theme-bg-color,#0f1115);--tx:var(--tg-theme-text-color,#e8e8ea);--hint:var(--tg-theme-hint-color,#9aa0aa);
+--btn:var(--tg-theme-button-color,#7c9cff);--btx:var(--tg-theme-button-text-color,#0f1115);--sec:var(--tg-theme-secondary-bg-color,#1b1f29);
+--link:var(--tg-theme-link-color,#7c9cff);--safe:max(env(safe-area-inset-bottom,0px),var(--tg-content-safe-area-inset-bottom,0px))}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;-webkit-user-select:none;user-select:none}
+button,input{font:inherit;color:inherit}button{cursor:pointer;border:0}
+main{max-width:640px;margin:0 auto;padding:12px 14px 24px}body.bar main{padding-bottom:96px}
+[hidden]{display:none!important}
+h1{font-size:20px;margin:6px 0 10px}.hint{color:var(--hint);font-size:13px}
+.search{position:sticky;top:0;z-index:5;background:var(--bg);padding:8px 0}
+.search input{width:100%;padding:12px 14px;border-radius:12px;border:0;background:var(--sec);outline:none;-webkit-user-select:text;user-select:text}
+.tabs{display:flex;gap:8px;margin:4px 0 8px}.tabs button{background:var(--sec);padding:7px 14px;border-radius:999px;font-size:14px;color:var(--hint)}
+.tabs button.on{background:var(--btn);color:var(--btx)}
+.card{display:block;width:100%;text-align:left;background:var(--sec);border-radius:12px;padding:13px 14px;margin:8px 0}
+.card b{display:block;font-weight:600;line-height:1.3}.card span{color:var(--hint);font-size:13px}
+.cont{background:var(--btn);color:var(--btx)}.cont span{color:var(--btx);opacity:.8}
+.empty{text-align:center;padding:36px 12px;color:var(--hint)}
+.primary{background:var(--btn);color:var(--btx);padding:11px 18px;border-radius:12px;font-weight:600}
+.ghost{background:var(--sec);padding:11px 16px;border-radius:12px}
+.top{display:flex;align-items:center;gap:8px}.back{background:var(--sec);width:38px;height:38px;border-radius:50%;font-size:18px;flex:none}
+.top h1{margin:0;line-height:1.25;font-size:18px}
+.jump{display:flex;gap:8px;margin:14px 0}.jump input{flex:1;min-width:0;padding:11px 14px;border-radius:12px;border:0;background:var(--sec);outline:none;-webkit-user-select:text;user-select:text}
+.grid{display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-top:10px}
+.ep{background:var(--sec);border-radius:10px;padding:11px 0;font-size:14px;position:relative}
+.ep.done{opacity:.55}.ep.tg::after{content:"✉";position:absolute;top:1px;right:4px;font-size:9px}
+.ep.now{background:var(--btn);color:var(--btx);opacity:1}.ep.flash{outline:2px solid var(--btn)}
+.ad{margin:16px 0;text-align:center}.ad small{display:block;color:var(--hint);font-size:11px;margin-bottom:4px}
+.ad iframe{border:0;width:100%;max-width:340px;background:transparent}
+#bar{position:fixed;left:0;right:0;bottom:0;background:var(--sec);padding:8px 14px calc(8px + var(--safe));z-index:10;box-shadow:0 -2px 12px rgba(0,0,0,.25)}
+#bar .in{max-width:640px;margin:0 auto;display:flex;align-items:center;gap:12px}
+#bar .t{flex:1;min-width:0;text-align:left;background:none;padding:4px 0}
+#bar .t b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:14px}#bar .t span{color:var(--hint);font-size:12px}
+#bar .pp{width:42px;height:42px;border-radius:50%;background:var(--btn);color:var(--btx);font-size:16px;flex:none}
+#bar .pg{position:absolute;left:0;top:0;height:2px;background:var(--btn);width:0}
+#full{position:fixed;inset:0;background:var(--bg);z-index:20;overflow:auto;padding:14px 22px calc(24px + var(--safe));transform:translateY(100%);transition:transform .25s}
+#full.open{transform:none}#full .w{max-width:420px;margin:0 auto;text-align:center}
+.art{font-size:64px;margin:18px 0 6px}.ft{font-size:20px;font-weight:600}.fe{color:var(--hint);margin-bottom:22px}
+input[type=range]{width:100%;accent-color:var(--btn);height:28px}.tm{display:flex;justify-content:space-between;color:var(--hint);font-size:13px}
+.row{display:flex;align-items:center;justify-content:center;gap:12px;margin:20px 0}
+.row button{background:var(--sec);border-radius:50%;width:48px;height:48px;font-size:14px}.row button:disabled{opacity:.35}
+.row #fpp{width:68px;height:68px;font-size:24px;background:var(--btn);color:var(--btx)}
+.opts{display:flex;justify-content:center;gap:10px}.opts button{background:var(--sec);padding:8px 14px;border-radius:999px;font-size:13px}
+#toast{position:fixed;left:50%;bottom:calc(90px + var(--safe));transform:translateX(-50%);background:#000c;color:#fff;padding:10px 16px;border-radius:12px;font-size:14px;z-index:40;max-width:86%;text-align:center}
+#gate{position:fixed;inset:0;background:var(--bg);z-index:50;display:flex;align-items:center;justify-content:center;text-align:center;padding:28px}
+#gate .b{max-width:340px}#gate p{white-space:pre-line}#gate .primary,#gate .ghost{display:block;width:100%;margin-top:10px}
+</style></head><body>
+<main>
+ <section id="home">
+  <h1>🎧 AUDIOS FM</h1>
+  <div class="search"><input id="q" type="search" placeholder="Search series…" autocomplete="off" enterkeyhint="search"></div>
+  <div class="tabs"><button id="tNew" class="on">Latest</button><button id="tAz">A–Z</button></div>
+  <button id="cont" class="card cont" hidden><b></b><span></span></button>
+  <div id="list"></div>
+  <div id="empty" class="empty" hidden><p id="emptyMsg"></p><button id="reqBtn" class="primary" hidden>Request this series</button></div>
+  <div id="sentinel" class="hint" style="text-align:center;padding:10px"></div>
+ </section>
+ <section id="series" hidden>
+  <div class="top"><button class="back" id="back">←</button><h1 id="sTitle"></h1></div>
+  <div class="hint" id="sMeta" style="margin:6px 0 0 46px"></div>
+  <div id="sCont" style="margin-top:12px" hidden><button class="card cont" id="sContBtn"><b></b><span></span></button></div>
+  <div class="jump"><input id="jump" type="number" inputmode="numeric" min="1" placeholder="Go to episode number"><button class="primary" id="go">Play</button></div>
+  <div class="ad" id="adS"></div>
+  <div class="hint" id="legend" hidden>✉ = can't be streamed here; tap to get it in your chat.</div>
+  <div class="grid" id="grid"></div>
+ </section>
+</main>
+
+<div id="bar" hidden>
+ <div class="pg" id="pg"></div>
+ <div class="in"><button class="t" id="barOpen"><b id="bT"></b><span id="bE"></span></button><button class="pp" id="bPP">▶</button></div>
+</div>
+
+<div id="full"><div class="w">
+ <div style="text-align:left"><button class="ghost" id="fClose">⌄ Close</button></div>
+ <div class="art">🎧</div><div class="ft" id="fT"></div><div class="fe" id="fE"></div>
+ <input type="range" id="seek" min="0" max="1000" value="0"><div class="tm"><span id="cur">0:00</span><span id="dur">0:00</span></div>
+ <div class="row"><button id="prev">⏮</button><button id="bk">-15</button><button id="fpp">▶</button><button id="fw">+15</button><button id="next">⏭</button></div>
+ <div class="opts"><button id="spd">1x</button><button id="slp">😴 Off</button></div>
+ <div class="ad" id="adP"></div>
+</div></div>
+
+<div id="gate" hidden><div class="b"><h1>🔒</h1><p id="gateMsg"></p><div id="gateLinks"></div><button class="ghost" id="gateRetry">Try again</button></div></div>
+<div id="toast" hidden></div>
+<audio id="a" preload="auto"></audio>
+
+<script>
+const tg=window.Telegram&&Telegram.WebApp,$=id=>document.getElementById(id),initData=tg?tg.initData:'';
+let cfg={ad:false,adh:280};
+if(tg){try{tg.ready();tg.expand();tg.setHeaderColor('secondary_bg_color');tg.disableVerticalSwipes&&tg.disableVerticalSwipes()}catch(e){}}
+const H=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!=null)e.textContent=x;return e};
+const LS={get(k,d){try{const v=localStorage.getItem(k);return v==null?d:JSON.parse(v)}catch(e){return d}},set(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}},del(k){try{localStorage.removeItem(k)}catch(e){}}};
+let tT;function toast(m){const t=$('toast');t.textContent=m;t.hidden=false;clearTimeout(tT);tT=setTimeout(()=>t.hidden=true,3200)}
+function fatal(m){$('gateMsg').textContent=m;$('gateLinks').textContent='';$('gate').hidden=false}
+function showGate(j){$('gateMsg').textContent=j.msg||'Access denied.';const box=$('gateLinks');box.textContent='';
+ (j.links||[]).forEach((l,i)=>{const b=H('button','primary','📢 Join channel'+(j.links.length>1?' '+(i+1):''));b.onclick=()=>{try{/t\.me\//.test(l)&&tg?tg.openTelegramLink(l):tg?tg.openLink(l):window.open(l)}catch(e){window.open(l)}};box.appendChild(b)});$('gate').hidden=false}
+$('gateRetry').onclick=()=>location.reload();
+
+async function api(path,body){
+ const r=await fetch(path,{method:body?'POST':'GET',headers:{'X-Init-Data':initData,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
+ let j=null;try{j=await r.json()}catch(e){}
+ if(r.status===401){fatal(initData?'Your session expired. Close this window and open the app again from the bot.':'Please open this app from Telegram (use the Open app button in the bot).');throw new Error('auth')}
+ if(r.status===403&&j&&j.error==='gate'){showGate(j);throw new Error('gate')}
+ if(!r.ok){const e=new Error((j&&j.msg)||'Something went wrong. Try again.');e.status=r.status;throw e}
+ return j}
+
+/* ---------- ads (only if /setad has code) ---------- */
+function mountAd(id){const box=$(id);if(!cfg.ad||box.firstChild)return;box.innerHTML='<small>Advertisement</small><iframe src="/adframe" loading="lazy" sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" style="height:'+(+cfg.adh||280)+'px"></iframe>'}
+
+/* ---------- views ---------- */
+let view='home',homeY=0,S=null;
+function show(v){if(view==='home')homeY=scrollY;view=v;$('home').hidden=v!=='home';$('series').hidden=v!=='series';
+ if(v==='home')setTimeout(()=>scrollTo(0,homeY),0);else scrollTo(0,0);sync()}
+function sync(){if(!tg)return;const need=view!=='home'||$('full').classList.contains('open');try{need?tg.BackButton.show():tg.BackButton.hide()}catch(e){}}
+function goBack(){if($('full').classList.contains('open'))return closeFull();if(view==='series')show('home')}
+if(tg){try{tg.BackButton.onClick(goBack)}catch(e){}}
+$('back').onclick=goBack;
+
+/* ---------- series list ---------- */
+const L={q:'',sort:'new',offset:0,more:false,busy:false,tok:0};
+function addCard(it){const b=H('button','card');b.appendChild(H('b','',it.title));
+ b.appendChild(H('span','',it.c+' episode'+(it.c==1?'':'s')+(it.p<it.c?(it.p?' · some via chat':' · via chat'):'')));b.onclick=()=>openSeries(it.id,it.title);$('list').appendChild(b)}
+async function loadList(reset){
+ if(L.busy&&!reset)return;
+ if(reset){L.offset=0;L.more=false;$('list').textContent='';L.tok++;$('empty').hidden=true}
+ const t=L.tok;L.busy=true;$('sentinel').textContent='Loading…';
+ try{const j=await api('/api/list?q='+encodeURIComponent(L.q)+'&sort='+L.sort+'&offset='+L.offset);
+  if(t!==L.tok)return;j.items.forEach(addCard);L.offset+=j.items.length;L.more=j.more;
+  const none=L.offset===0;$('empty').hidden=!none;
+  if(none){$('emptyMsg').textContent=L.q?'No series found for “'+L.q+'”.':'No series have been added yet.';$('reqBtn').hidden=!L.q}
+ }catch(e){if(t===L.tok&&e.message!=='auth'&&e.message!=='gate')toast(e.message)}
+ finally{if(t===L.tok){L.busy=false;$('sentinel').textContent='';setTimeout(()=>{if(L.more&&$('sentinel').getBoundingClientRect().top<innerHeight+300)loadList(false)},0)}}}
+new IntersectionObserver(es=>{if(es[0].isIntersecting&&L.more&&!L.busy)loadList(false)},{rootMargin:'400px'}).observe($('sentinel'));
+let qT;$('q').oninput=e=>{clearTimeout(qT);qT=setTimeout(()=>{L.q=e.target.value.trim();loadList(true)},300)};
+function tab(s){L.sort=s;$('tNew').classList.toggle('on',s==='new');$('tAz').classList.toggle('on',s==='az');loadList(true)}
+$('tNew').onclick=()=>tab('new');$('tAz').onclick=()=>tab('az');
+$('reqBtn').onclick=async()=>{try{const j=await api('/api/request',{text:L.q});toast(j.msg);if(j.ok)$('reqBtn').hidden=true}catch(e){toast(e.message)}};
+
+/* ---------- series page ---------- */
+const doneSet=sid=>new Set(LS.get('done:'+sid,[]));
+async function openSeries(sid,title){
+ S=null;$('sTitle').textContent=title||'';$('sMeta').textContent='';$('grid').textContent='';$('jump').value='';$('sCont').hidden=true;show('series');mountAd('adS');
+ try{const j=await api('/api/story/'+sid);S={id:sid,title:j.title,eps:j.eps};renderSeries()}
+ catch(e){if(e.message!=='auth'&&e.message!=='gate')toast(e.message);show('home')}}
+function renderSeries(){
+ $('sTitle').textContent=S.title;$('sMeta').textContent=S.eps.length+' episode'+(S.eps.length==1?'':'s');
+ const done=doneSet(S.id),g=$('grid');g.textContent='';let anyTg=false;
+ S.eps.forEach(([seq,p])=>{const b=H('button','ep'+(done.has(seq)?' done':'')+(p?'':' tg'),String(seq));b.dataset.seq=seq;if(!p)anyTg=true;g.appendChild(b)});
+ $('legend').hidden=!anyTg;markNow();
+ const last=LS.get('last',null);
+ if(last&&last.sid===S.id&&S.eps.some(e=>e[0]===last.seq)){const c=$('sContBtn');c.firstChild.textContent='Continue · Episode '+last.seq;c.lastChild.textContent='Pick up where you stopped';$('sCont').hidden=false}}
+$('sContBtn').onclick=()=>{const l=LS.get('last',null);if(l)tapEp(l.seq)};
+$('grid').onclick=e=>{const b=e.target.closest('.ep');if(b)tapEp(+b.dataset.seq)};
+function markNow(){document.querySelectorAll('#grid .ep.now').forEach(x=>x.classList.remove('now'));
+ if(S&&cur&&cur.sid===S.id){const b=document.querySelector('#grid .ep[data-seq="'+cur.seq+'"]');if(b)b.classList.add('now')}}
+function tapEp(seq){if(!S)return;const e=S.eps.find(x=>x[0]===seq);if(!e){toast('Episode '+seq+' is not available.');return}
+ if(e[1])return playEpisode(S.id,seq,S.title);
+ const msg='Episode '+seq+' can’t be streamed here. Send it to your chat?';
+ const go=ok=>{if(ok)sendToChat(S.id,seq)};
+ if(tg&&tg.showConfirm)tg.showConfirm(msg,go);else go(confirm(msg))}
+async function sendToChat(sid,seq){try{toast('Sending…');const j=await api('/api/send',{sid,seq});toast(j.msg)}catch(e){toast(e.message)}}
+function jump(){const n=parseInt($('jump').value,10);if(!n)return;tapEp(n);
+ const b=document.querySelector('#grid .ep[data-seq="'+n+'"]');if(b){b.scrollIntoView({block:'center',behavior:'smooth'});b.classList.add('flash');setTimeout(()=>b.classList.remove('flash'),1500)}}
+$('go').onclick=jump;$('jump').onkeydown=e=>{if(e.key==='Enter')jump()};
+
+/* ---------- player ---------- */
+const A=$('a');let cur=null,rate=1,sleepT=null,sleepMin=0,seeking=false,pend=0;
+const fmt=t=>{t=Math.floor(t||0);const m=Math.floor(t/60),x=t%60;return m+':'+(x<10?'0':'')+x};
+async function playEpisode(sid,seq,title){
+ pend=seq;
+ try{const j=await api('/api/play',{sid,seq});if(pend!==seq)return;
+  cur={sid,seq,title:j.title||title,prev:j.prev,next:j.next};
+  A.src=j.url;A.playbackRate=rate;A.load();
+  const p=LS.get('pos:'+sid+':'+seq,0);A.onloadedmetadata=()=>{$('dur').textContent=fmt(A.duration);if(p>5&&p<A.duration-5)A.currentTime=p};
+  A.play().catch(()=>{});LS.set('last',{sid,seq,title:cur.title});ui();media();markNow()}
+ catch(e){if(e.message!=='auth'&&e.message!=='gate')toast(e.message)}}
+function ui(){if(!cur)return;document.body.classList.add('bar');$('bar').hidden=false;
+ $('bT').textContent=cur.title;$('bE').textContent='Episode '+cur.seq;$('fT').textContent=cur.title;$('fE').textContent='Episode '+cur.seq;
+ $('prev').disabled=!cur.prev;$('next').disabled=!cur.next;$('dur').textContent='0:00';$('cur').textContent='0:00';$('seek').value=0;$('pg').style.width='0';mountAd('adP')}
+function pp(){if(!cur)return;A.paused?A.play().catch(()=>{}):A.pause()}
+$('bPP').onclick=pp;$('fpp').onclick=pp;
+A.onplay=()=>{$('bPP').textContent=$('fpp').textContent='❚❚'};A.onpause=()=>{$('bPP').textContent=$('fpp').textContent='▶';savePos()};
+A.ontimeupdate=()=>{if(!A.duration)return;const f=A.currentTime/A.duration;$('pg').style.width=(f*100)+'%';if(!seeking){$('seek').value=f*1000;$('cur').textContent=fmt(A.currentTime)}};
+A.onerror=()=>{if(cur)toast('Could not play this episode. Close the app, open it again and retry.')};
+function savePos(){if(cur&&A.currentTime>5)LS.set('pos:'+cur.sid+':'+cur.seq,A.currentTime)}
+setInterval(()=>{if(!A.paused)savePos()},5000);
+A.onended=()=>{if(!cur)return;LS.del('pos:'+cur.sid+':'+cur.seq);const d=doneSet(cur.sid);d.add(cur.seq);LS.set('done:'+cur.sid,[...d]);
+ const b=S&&S.id===cur.sid&&document.querySelector('#grid .ep[data-seq="'+cur.seq+'"]');if(b)b.classList.add('done');
+ if(cur.next)playEpisode(cur.sid,cur.seq+1,cur.title)};
+$('seek').oninput=()=>{seeking=true;$('cur').textContent=fmt($('seek').value/1000*A.duration)};
+$('seek').onchange=()=>{if(A.duration)A.currentTime=$('seek').value/1000*A.duration;seeking=false};
+const skip=d=>{A.currentTime=Math.max(0,Math.min(A.duration||1e9,A.currentTime+d))};
+$('bk').onclick=()=>skip(-15);$('fw').onclick=()=>skip(15);
+const step=d=>{if(cur&&(d<0?cur.prev:cur.next))playEpisode(cur.sid,cur.seq+d,cur.title)};
+$('prev').onclick=()=>step(-1);$('next').onclick=()=>step(1);
+const RATES=[1,1.25,1.5,2];$('spd').onclick=()=>{rate=RATES[(RATES.indexOf(rate)+1)%RATES.length];A.playbackRate=rate;$('spd').textContent=rate+'x'};
+const SLP=[0,15,30,60];$('slp').onclick=()=>{sleepMin=SLP[(SLP.indexOf(sleepMin)+1)%SLP.length];clearTimeout(sleepT);
+ $('slp').textContent='😴 '+(sleepMin?sleepMin+' min':'Off');if(sleepMin)sleepT=setTimeout(()=>{A.pause();sleepMin=0;$('slp').textContent='😴 Off';toast('Sleep timer: paused')},sleepMin*60000)};
+function openFull(){if(!cur)return;$('full').classList.add('open');sync()}
+function closeFull(){$('full').classList.remove('open');sync()}
+$('barOpen').onclick=openFull;$('fClose').onclick=closeFull;
+function media(){if(!('mediaSession' in navigator)||!cur)return;
+ try{navigator.mediaSession.metadata=new MediaMetadata({title:'Episode '+cur.seq,artist:cur.title,album:'AUDIOS FM'});
+  const m=navigator.mediaSession;m.setActionHandler('play',pp);m.setActionHandler('pause',pp);
+  m.setActionHandler('seekbackward',()=>skip(-15));m.setActionHandler('seekforward',()=>skip(15));
+  m.setActionHandler('previoustrack',()=>step(-1));m.setActionHandler('nexttrack',()=>step(1))}catch(e){}}
+document.addEventListener('contextmenu',e=>e.preventDefault());
+
+/* ---------- start ---------- */
+(async function(){
+ if(!initData){fatal('Please open this app from Telegram (use the Open app button in the bot).');return}
+ try{cfg=await api('/api/config')}catch(e){return}
+ const last=LS.get('last',null);
+ if(last){const c=$('cont');c.firstChild.textContent='Continue: '+last.title;c.lastChild.textContent='Episode '+last.seq;c.hidden=false;
+  c.onclick=async()=>{await openSeries(last.sid,last.title);playEpisode(last.sid,last.seq,last.title)}}
+ loadList(true)})();
+</script></body></html>

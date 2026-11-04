@@ -304,6 +304,11 @@ async def audio(request):
     ep = await asyncio.to_thread(_episode, sid, seq)
     if not ep or ep["key"].startswith("tg/"):
         return web.Response(status=404)
+    return await serve_episode(request, ep)
+
+
+async def serve_episode(request, ep):
+    """Stream one R2 episode (range-capable, throttled). Callers must have authorized the request already."""
     rng = request.headers.get("Range", "")
     kw = {"Range": rng} if RANGE_RE.match(rng) else {}
     s3 = CTX["s3"]
@@ -358,6 +363,8 @@ async def start(_application=None):
     app.router.add_get("/p/{tok}", player)
     app.router.add_get("/a/{tok}", audio)
     app.router.add_get("/ad/{tok}", ad_frame)
+    import miniapp  # Telegram Mini App (/app and /api/*); imported here to avoid a circular import
+    miniapp.add_routes(app)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", PORT).start()
