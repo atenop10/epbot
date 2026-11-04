@@ -39,6 +39,20 @@ STORAGE_CHANNEL = int(os.environ["STORAGE_CHANNEL_ID"]) if os.environ.get("STORA
 # Paid-only mode is OFF by default. Set REQUIRE_SUBSCRIPTION=true in .env to turn it back on.
 REQUIRE_SUB = os.environ.get("REQUIRE_SUBSCRIPTION", "false").strip().lower() in ("1", "true", "yes", "on")
 
+# Force-join: users must be members of these channels before they can use the bot. Comma separated, e.g.
+# FORCE_SUB_CHANNELS=@mychannel,-1001234567890|https://t.me/+InviteLink   (private channels need |invite link)
+FORCE_SUB = []
+for _raw in os.environ.get("FORCE_SUB_CHANNELS", "").split(","):
+    _ref, _, _link = _raw.strip().partition("|")
+    _ref, _link = _ref.strip(), _link.strip()
+    if not _ref:
+        continue
+    _chat = int(_ref) if _ref.lstrip("-").isdigit() else (_ref if _ref.startswith("@") else "@" + _ref)
+    if not _link and isinstance(_chat, str):
+        _link = f"https://t.me/{_chat[1:]}"
+    FORCE_SUB.append((_chat, _link))
+FSUB_CACHE, FSUB_TTL = {}, 600  # a user who passed the check is trusted for 10 minutes
+
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("episodes-bot")
@@ -46,7 +60,7 @@ log = logging.getLogger("episodes-bot")
 s3 = boto3.client(
     "s3", endpoint_url=R2_ENDPOINT, aws_access_key_id=R2_KEY_ID, aws_secret_access_key=R2_SECRET,
     region_name="auto", config=Config(signature_version="s3v4", s3={"addressing_style": "path"},
-                                      retries={"max_attempts": 3}, max_pool_connections=50),
+                                      retries={"max_attempts": 3}, max_pool_connections=200),
 )
 KEY_RE = re.compile(r"^audio/(\d+)/[^/]+\.(mp3|m4a|aac|wav|ogg|opus|webm|flac)$", re.I)
 
@@ -100,11 +114,45 @@ async def check_access(uid):
     return False, f"{head}\n{CONTACT_TEXT}\n\nYour Telegram ID: {uid}"
 
 
+async def missing_channels(bot, uid):
+    """Force-join channels this user has not joined yet (empty list = allowed)."""
+    if not FORCE_SUB or uid in ADMIN_IDS or time.time() - FSUB_CACHE.get(uid, 0) < FSUB_TTL:
+        return []
+    missing = []
+    for chat, link in FORCE_SUB:
+        try:
+            m = await bot.get_chat_member(chat, uid)
+            joined = m.status in ("member", "administrator", "creator") or (m.status == "restricted" and getattr(m, "is_member", False))
+        except Exception as e:  # bot not admin / wrong id: don't lock everyone out
+            log.warning("force-join check failed for %s (is the bot an admin there?): %s", chat, e)
+            continue
+        if not joined:
+            missing.append((chat, link))
+    if not missing:
+        FSUB_CACHE[uid] = time.time()
+    return missing
+
+
+async def force_prompt(message, missing):
+    many = len(missing) > 1
+    kb = [[InlineKeyboardButton(f"📢 Join channel {i}" if many else "📢 Join channel", url=link)]
+          for i, (_, link) in enumerate(missing, 1) if link]
+    kb.append([InlineKeyboardButton("✅ I've joined", callback_data="fsub:ok")])
+    await message.reply_text("🔒 To use this bot, please join our channel" + ("s" if many else "") +
+                             " first, then tap ✅ I've joined.", reply_markup=InlineKeyboardMarkup(kb))
+
+
 async def guard(update):
-    ok, msg = await check_access(update.effective_user.id)
+    uid = update.effective_user.id
+    ok, msg = await check_access(uid)
     if not ok:
         await update.effective_message.reply_text(msg)
-    return ok
+        return False
+    miss = await missing_channels(update.get_bot(), uid)
+    if miss:
+        await force_prompt(update.effective_message, miss)
+        return False
+    return True
 
 
 # ------------------------------------------------------------ R2
@@ -174,6 +222,7 @@ def help_text(is_admin):
             "/revoke <telegram id> - remove access\n"
             "/subs - list paid users\n"
             "/clearcache - forget cached Telegram files\n"
+            "/forcesub - check the force-join channel setup\n"
             "/requests - pending user requests\n"
             "/reqdone <request id> - mark a request as added (notifies the user)\n"
             "/stats\n\nAdmins don't need a subscription."
@@ -196,8 +245,9 @@ async def reply_long(update, text):
 
 # ------------------------------------------------------------ user commands
 async def cmd_start(update, context):
-    ok, msg = await check_access(update.effective_user.id)
-    await update.message.reply_text("Welcome to AUDIOS FM! Send a series name to search. /help for instructions." if ok else msg)
+    if not await guard(update):
+        return
+    await update.message.reply_text("Welcome to AUDIOS FM! Send a series name to search. /help for instructions.")
 
 
 async def cmd_help(update, context):
@@ -331,6 +381,27 @@ async def cmd_clearcache(update, context):
         con.execute("UPDATE episodes SET file_id=NULL, kind=NULL")
         con.commit()
     await update.message.reply_text("🧹 Cache cleared.")
+
+
+@admin_cmd
+async def cmd_forcesub(update, context):
+    if not FORCE_SUB:
+        await update.message.reply_text("Force-join is OFF. Set FORCE_SUB_CHANNELS in .env (for example @mychannel) and restart the bot.")
+        return
+    me = await context.bot.get_me()
+    lines = ["🔒 Force-join channels:"]
+    for chat, link in FORCE_SUB:
+        try:
+            c = await context.bot.get_chat(chat)
+            m = await context.bot.get_chat_member(chat, me.id)
+            good = m.status in ("administrator", "creator")
+            lines.append(f"{'✅' if good else '⚠️'} {c.title} ({chat}) - bot is {m.status}"
+                         + ("" if good else " - make the bot an admin so it can check members"))
+        except Exception as e:
+            lines.append(f"❌ {chat} - cannot access: {e}")
+        if not link:
+            lines.append("   ⚠️ no join link - add |https://t.me/+yourInviteLink after the id in .env")
+    await reply_long(update, "\n".join(lines))
 
 
 async def track_user(update, context):
@@ -627,12 +698,30 @@ async def on_text(update, context):
 
 async def on_callback(update, context):
     q = update.callback_query
-    await q.answer()
+    action, _, val = q.data.partition(":")
+    if action != "fsub":
+        await q.answer()
     ok, msg = await check_access(q.from_user.id)
     if not ok:
+        if action == "fsub":
+            await q.answer()
         await q.message.reply_text(msg)
         return
-    action, _, val = q.data.partition(":")
+    if action == "fsub":  # "I've joined" button: re-check now
+        FSUB_CACHE.pop(q.from_user.id, None)
+        if await missing_channels(context.bot, q.from_user.id):
+            await q.answer("You haven't joined yet. Join the channel, then tap again.", show_alert=True)
+            return
+        await q.answer()
+        try:
+            await q.edit_message_text("✅ Thanks for joining! Send a series name to search, or use /list.")
+        except Exception:
+            pass
+        return
+    miss = await missing_channels(context.bot, q.from_user.id)
+    if miss:
+        await force_prompt(q.message, miss)
+        return
     if action == "list":
         data = list_page(int(val))
         if data:
@@ -765,7 +854,7 @@ def main():
                      ("stories", cmd_stories), ("name", cmd_name), ("swap", cmd_swap), ("grant", cmd_grant),
                      ("revoke", cmd_revoke), ("subs", cmd_subs), ("clearcache", cmd_clearcache), ("stats", cmd_stats),
                      ("addto", cmd_addto), ("done", cmd_done),
-                     ("list", cmd_list), ("request", cmd_request), ("requests", cmd_requests), ("reqdone", cmd_reqdone)]:
+                     ("forcesub", cmd_forcesub), ("list", cmd_list), ("request", cmd_request), ("requests", cmd_requests), ("reqdone", cmd_reqdone)]:
         app.add_handler(CommandHandler(name, fn, filters=priv))
     app.add_handler(MessageHandler((filters.AUDIO | filters.Document.ALL) & priv, on_file))
     app.add_handler(CallbackQueryHandler(on_callback))

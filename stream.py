@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 
 from aiohttp import web
@@ -257,6 +258,8 @@ async def audio(request):
 async def start(_application=None):
     if not ENABLED:
         return
+    # many listeners at once: give blocking R2 reads plenty of worker threads (the default is only a handful)
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=64))
     app = web.Application()
     app.router.add_get("/p/{tok}", player)
     app.router.add_get("/a/{tok}", audio)
