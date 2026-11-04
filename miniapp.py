@@ -12,6 +12,8 @@ STREAM_BASE_URL / STREAM_SECRET settings and the same HTTPS domain. Nothing new 
   POST /api/request        "please add this series" request
   GET  /m/<token>          the audio stream for the Mini App
   GET  /adframe            the /setad banner (sandboxed), shown in the app if an ad is set
+  POST /api/ad/start       rewarded ads: gives a signed one-time token before the ad is shown
+  POST /api/ad/claim       rewarded ads: after the ad, turns the token into time-limited access (see adpass.py)
 
 Every /api call must carry Telegram's signed "initData" (header X-Init-Data). It is checked with the bot token,
 so nobody can pretend to be another user. The bot's own rules (subscription, force-join) are applied on every call.
@@ -28,6 +30,7 @@ from urllib.parse import parse_qsl
 
 from aiohttp import web
 
+import adpass
 import stream
 
 log = logging.getLogger("episodes-bot.miniapp")
@@ -109,35 +112,43 @@ def _like_clauses(q):
     return clauses, params
 
 
-async def _gate(uid):
-    """Subscription + force-join rules of the bot. Returns None if allowed, else an error response."""
+async def _gate(uid, allow_adwall=False):
+    """Subscription + force-join rules of the bot. Returns None if allowed, else an error response.
+    With allow_adwall, a user who only lacks time (ad-unlock mode) is let through to the few endpoints that unlock it."""
     cb = stream.CTX.get("gate")
     if cb:
         res = await cb(uid)
     else:
         ok, msg = await stream.CTX["check_access"](uid)
         res = {"ok": ok, "msg": msg, "links": []}
-    if res.get("ok"):
+    if res.get("ok") or (allow_adwall and res.get("adwall")):
         return None
-    return _json({"error": "gate", "msg": res.get("msg", "Access denied."), "links": res.get("links", [])}, 403)
+    return _json({"error": "gate", "adwall": bool(res.get("adwall")), "msg": res.get("msg", "Access denied."),
+                  "links": res.get("links", [])}, 403)
 
 
-def api(fn):
-    async def wrapper(request):
-        user = check_init_data(request.headers.get("X-Init-Data", ""))
-        if not user:
-            return _json({"error": "auth"}, 401)
-        denied = await _gate(user["id"])
-        if denied:
-            return denied
-        try:
-            return await fn(request, user)
-        except web.HTTPException:
-            raise
-        except Exception:
-            log.exception("miniapp api error in %s", fn.__name__)
-            return _json({"error": "server"}, 500)
-    return wrapper
+def _api(allow_adwall):
+    def deco(fn):
+        async def wrapper(request):
+            user = check_init_data(request.headers.get("X-Init-Data", ""))
+            if not user:
+                return _json({"error": "auth"}, 401)
+            denied = await _gate(user["id"], allow_adwall)
+            if denied:
+                return denied
+            try:
+                return await fn(request, user)
+            except web.HTTPException:
+                raise
+            except Exception:
+                log.exception("miniapp api error in %s", fn.__name__)
+                return _json({"error": "server"}, 500)
+        return wrapper
+    return deco
+
+
+api = _api(False)      # normal endpoints: need access (paid, admin, or an active ad pass)
+api_ad = _api(True)    # config + ad endpoints: also open to a user who just needs to watch an ad
 
 
 async def _body(request):
@@ -168,8 +179,8 @@ def _page_html():
 
 
 def app_csp():
-    if stream.head_html():  # an ad network tag was set with /sethead: let its https scripts/frames load
-        return stream.player_csp()
+    if stream.head_html() or adpass.ENABLED:  # ad network tag (/sethead) or rewarded-ad SDK: let its https scripts/frames load
+        return stream.player_csp(force=True)
     return ("default-src 'self'; script-src 'unsafe-inline' https://telegram.org; style-src 'unsafe-inline'; "
             "img-src 'self' data:; connect-src 'self'; media-src 'self'; frame-src 'self'")
 
@@ -196,10 +207,34 @@ async def adframe(request):
 
 
 # ------------------------------------------------------------ API
-@api
+@api_ad
 async def config(request, user):
+    cb = stream.CTX.get("adstatus")
+    reward = await cb(user["id"]) if cb else {"on": False}
     return _json({"ad": bool(stream.ad_html()), "adh": stream.AD_HEIGHT, "uid": user["id"],
-                  "name": user.get("first_name", "")})
+                  "name": user.get("first_name", ""), "reward": reward})
+
+
+@api_ad
+async def ad_start(request, user):
+    if not adpass.ENABLED:
+        return _json({"error": "off", "msg": "Ad unlock is not turned on."}, 404)
+    if _limited(user["id"], "adstart", 10, 60):
+        return _json({"error": "slow", "msg": "Too many requests - wait a moment."}, 429)
+    return _json({"token": adpass.make_token(user["id"])})
+
+
+@api_ad
+async def ad_claim(request, user):
+    if not adpass.ENABLED:
+        return _json({"error": "off", "msg": "Ad unlock is not turned on."}, 404)
+    if _limited(user["id"], "adclaim", 10, 60):
+        return _json({"error": "slow", "msg": "Too many requests - wait a moment."}, 429)
+    data = await _body(request)
+    res = await asyncio.to_thread(adpass.claim, stream.CTX["db"], user["id"], data.get("token", ""), bool(data.get("failed")))
+    if res.get("ok"):
+        log.info("ad pass: user %s +%s min (%s)", user["id"], res.get("mins"), res.get("kind"))
+    return _json(res)
 
 
 def _list_sql(q, sort, limit, offset):
@@ -352,6 +387,8 @@ def add_routes(app):
     app.router.add_get("/app", page)
     app.router.add_get("/adframe", adframe)
     app.router.add_get("/api/config", config)
+    app.router.add_post("/api/ad/start", ad_start)
+    app.router.add_post("/api/ad/claim", ad_claim)
     app.router.add_get("/api/list", list_series)
     app.router.add_get("/api/story/{sid}", story)
     app.router.add_post("/api/play", play)

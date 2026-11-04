@@ -17,6 +17,7 @@ from datetime import datetime
 import boto3
 from botocore.config import Config
 
+import adpass
 import stream
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MenuButtonWebApp, Update, WebAppInfo
 from telegram.ext import (
@@ -90,6 +91,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS plays(user_id INTEGER NOT NULL, story_id INTEGER NOT NULL, seq INTEGER NOT NULL, ts INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS plays_ts ON plays(ts);
         """)
+        con.executescript(adpass.SCHEMA)
         cols = {r[1] for r in con.execute("PRAGMA table_info(episodes)")}
         for col in ("tg_chat", "tg_msg"):  # Telegram-stored episodes: channel id + message id
             if col not in cols:
@@ -108,9 +110,16 @@ def sub_expiry(uid):
 
 
 async def check_access(uid):
-    if not REQUIRE_SUB or uid in ADMIN_IDS or sub_expiry(uid) > time.time():
+    # Gate is ON when paid-only mode is on, or when ad-unlock is on (AD_REWARD_ZONE set).
+    if not (REQUIRE_SUB or adpass.ENABLED) or uid in ADMIN_IDS or sub_expiry(uid) > time.time():
+        return True, ""
+    if adpass.ENABLED and adpass.remaining(db, uid) > 0:   # watched an ad: time-limited access
         return True, ""
     exp = sub_expiry(uid)
+    if adpass.ENABLED:
+        head = "⛔ Your subscription has expired.\n" if exp else ""
+        return False, (f"{head}🎧 Open the app and watch a short ad to listen free for {adpass.MINUTES} min.\n\n"
+                       f"Want it without ads? {CONTACT_TEXT}\n\nYour Telegram ID: {uid}")
     head = "⛔ Your subscription has expired." if exp else "🔒 This bot is only for paid members."
     return False, f"{head}\n{CONTACT_TEXT}\n\nYour Telegram ID: {uid}"
 
@@ -147,7 +156,7 @@ async def guard(update):
     uid = update.effective_user.id
     ok, msg = await check_access(uid)
     if not ok:
-        await update.effective_message.reply_text(msg)
+        await update.effective_message.reply_text(msg, reply_markup=app_button() if adpass.ENABLED else None)
         return False
     miss = await missing_channels(update.get_bot(), uid)
     if miss:
@@ -209,7 +218,7 @@ def help_text(is_admin):
         "/list - browse all available series\n"
         "/request <name> - ask for a series that isn't here\n\n"
         f"Episodes are protected and auto-delete after {max(DELETE_AFTER // 60, 1)} min - listen or save quickly.\n\n"
-        "/start - welcome\n/help - this message\n/status - your subscription"
+        "/start - welcome\n/help - this message\n/status - your subscription / free time left"
     )
     if is_admin:
         t += (
@@ -232,6 +241,7 @@ def help_text(is_admin):
             "/sethead <tag> - set the ad network's site-verification tag (/sethead off to remove)\n"
             "/requests - pending user requests\n"
             "/reqdone <request id> - mark a request as added (notifies the user)\n"
+            "/adstats - rewarded ads watched (ad-unlock mode)\n"
             "/stats\n\nAdmins don't need a subscription."
         )
     return t
@@ -285,15 +295,20 @@ async def cmd_status(update, context):
     if uid in ADMIN_IDS:
         await update.message.reply_text("👑 Admin - full access.")
         return
-    if not REQUIRE_SUB:
+    if not (REQUIRE_SUB or adpass.ENABLED):
         await update.message.reply_text("✅ Open access - no subscription needed right now.")
         return
     exp = sub_expiry(uid)
     if exp > time.time():
         await update.message.reply_text(f"✅ Active until {fmt(exp)}.")
+        return
+    left = adpass.remaining(db, uid) if adpass.ENABLED else 0
+    if left > 0:
+        await update.message.reply_text(f"⏱ Free listening: {max(left // 60, 1)} min left.\nOpen the app and tap + time to add more.",
+                                        reply_markup=app_button())
     else:
         ok, msg = await check_access(uid)
-        await update.message.reply_text(msg)
+        await update.message.reply_text(msg, reply_markup=app_button() if adpass.ENABLED else None)
 
 
 # ------------------------------------------------------------ admin commands
@@ -731,6 +746,21 @@ async def cmd_stats(update, context):
     await update.message.reply_text("\n".join(lines))
 
 
+@admin_cmd
+async def cmd_adstats(update, context):
+    if not adpass.ENABLED:
+        await update.message.reply_text("Ad-unlock is OFF. Set AD_REWARD_ZONE in .env (see REWARDED_ADS.md) and restart.")
+        return
+    st = adpass.stats(db)
+    await update.message.reply_text(
+        "🎁 Ad-unlock\n"
+        f"Zone {adpass.ZONE}, {adpass.MINUTES} min per ad, max {adpass.MAX_PER_DAY} per user per day\n\n"
+        f"Ads watched: {st['ads_1d']} in 24h, {st['ads_7d']} in 7 days, {st['ads_all']} total\n"
+        f"Viewers: {st['users_1d']} in 24h, {st['users_7d']} in 7 days\n"
+        f"Listening on a free pass right now: {st['active']}\n"
+        f"Ad could not load (short fallback pass): {st['grace_1d']} in 24h")
+
+
 # ------------------------------------------------------------ add episodes from the bot
 ADD_LOCK = asyncio.Lock()
 TG_DOWNLOAD_MAX = 20 * 1024 * 1024  # standard Bot API: bots can only download files up to 20 MB
@@ -1024,7 +1054,7 @@ async def on_callback(update, context):
     if not ok:
         if action == "fsub":
             await q.answer()
-        await q.message.reply_text(msg)
+        await q.message.reply_text(msg, reply_markup=app_button() if adpass.ENABLED else None)
         return
     if action == "fsub":  # "I've joined" button: re-check now
         FSUB_CACHE.pop(q.from_user.id, None)
@@ -1166,12 +1196,24 @@ class _Ctx:
 
 async def api_gate(uid):
     ok, msg = await check_access(uid)
-    if not ok:
+    if not ok and not adpass.ENABLED:
         return {"ok": False, "msg": msg, "links": []}
-    miss = await missing_channels(BOT_APP.bot, uid)
+    miss = await missing_channels(BOT_APP.bot, uid)   # with ad-unlock on, joining the channel comes first
     if miss:
         return {"ok": False, "msg": "🔒 Please join our channel first, then tap Try again.", "links": [l for _, l in miss if l]}
+    if not ok:  # ad-unlock mode: the app shows the "watch an ad" screen instead of an error
+        return {"ok": False, "adwall": True, "msg": msg, "links": []}
     return {"ok": True}
+
+
+async def api_adstatus(uid):
+    """What the Mini App needs to know about ad-unlock for this user."""
+    if not adpass.ENABLED:
+        return {"on": False}
+    free = uid not in ADMIN_IDS and sub_expiry(uid) <= time.time()   # paid users and admins never see ads gates
+    return {"on": True, "free": free, "zone": adpass.ZONE, "sdk": adpass.SDK_URL, "mins": adpass.MINUTES,
+            "rem": adpass.remaining(db, uid) if free else 0, "inapp": adpass.INAPP if free else None,
+            "contact": CONTACT_TEXT}
 
 
 async def api_send(uid, sid, seq):
@@ -1241,7 +1283,7 @@ def main():
         raise SystemExit("Set ADMIN_IDS in .env (your Telegram user id).")
     init_db()
     stream.configure(db, s3, R2_BUCKET, check_access)
-    stream.CTX.update(gate=api_gate, send=api_send, request=api_request)
+    stream.CTX.update(gate=api_gate, send=api_send, request=api_request, adstatus=api_adstatus)
     builder = Application.builder().token(BOT_TOKEN).concurrent_updates(True)
     if stream.ENABLED:
         builder = builder.post_init(on_start).post_shutdown(stream.stop)
@@ -1252,7 +1294,7 @@ def main():
                      ("stories", cmd_stories), ("name", cmd_name), ("swap", cmd_swap), ("grant", cmd_grant),
                      ("revoke", cmd_revoke), ("subs", cmd_subs), ("clearcache", cmd_clearcache), ("stats", cmd_stats),
                      ("addto", cmd_addto), ("done", cmd_done), ("delete", cmd_delete), ("renumber", cmd_renumber),
-                     ("forcesub", cmd_forcesub), ("setad", cmd_setad), ("adtest", cmd_adtest), ("sethead", cmd_sethead), ("list", cmd_list), ("request", cmd_request), ("requests", cmd_requests), ("reqdone", cmd_reqdone)]:
+                     ("forcesub", cmd_forcesub), ("setad", cmd_setad), ("adtest", cmd_adtest), ("adstats", cmd_adstats), ("sethead", cmd_sethead), ("list", cmd_list), ("request", cmd_request), ("requests", cmd_requests), ("reqdone", cmd_reqdone)]:
         app.add_handler(CommandHandler(name, fn, filters=priv))
     app.add_handler(MessageHandler((filters.AUDIO | filters.Document.ALL) & priv, on_file))
     app.add_handler(CallbackQueryHandler(on_callback))

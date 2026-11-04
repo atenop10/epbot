@@ -1,5 +1,7 @@
 # Ads on the player page - setup
 
+> Want users to **watch an ad to unlock time-limited access**? That is a separate feature: see `REWARDED_ADS.md`.
+
 The ad shows on the **web player** (the page the "Play" button opens), under the Prev / Next links.
 It does not show for episodes sent as Telegram audio files.
 

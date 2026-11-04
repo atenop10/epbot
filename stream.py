@@ -153,7 +153,7 @@ async def _authorize(tok):
         return None, _page("This link has expired. Go back to the bot and request the episode again.", 410)
     ok, _ = await CTX["check_access"](uid)
     if not ok:
-        return None, _page("Your subscription has ended. Go back to the bot for details.")
+        return None, _page("Your access has ended. Go back to the bot and open the app to unlock more time.")
     return info, None
 
 
@@ -167,9 +167,10 @@ async def home(request):
     return web.Response(text=page, content_type="text/html", headers={"Cache-Control": "no-cache"})
 
 
-def player_csp():
-    """Strict CSP by default. If a head tag (e.g. Monetag zone script) is set with /sethead, allow https scripts/frames so the ad network can load."""
-    if head_html():
+def player_csp(force=False):
+    """Strict CSP by default. If a head tag (e.g. Monetag zone script) is set with /sethead (or force=True, used by the
+    Mini App when rewarded ads are on), allow https scripts/frames so the ad network can load."""
+    if force or head_html():
         return ("default-src 'self' https: data: blob:; style-src 'unsafe-inline' https:; "
                 "script-src 'unsafe-inline' 'unsafe-eval' https:; img-src https: data: blob:; "
                 "connect-src 'self' https: wss:; frame-src https:; media-src 'self'")

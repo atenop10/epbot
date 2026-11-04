@@ -1,21 +1,21 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
-<meta name="robots" content="noindex"><meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex"><meta name="referrer" content="strict-origin-when-cross-origin">
 @@HEAD@@
 <title>AUDIOS FM</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
 :root{--bg:var(--tg-theme-bg-color,#0f1115);--tx:var(--tg-theme-text-color,#e8e8ea);--hint:var(--tg-theme-hint-color,#9aa0aa);
 --btn:var(--tg-theme-button-color,#7c9cff);--btx:var(--tg-theme-button-text-color,#0f1115);--sec:var(--tg-theme-secondary-bg-color,#1b1f29);
---link:var(--tg-theme-link-color,#7c9cff);--adtop:0px;--safe:max(env(safe-area-inset-bottom,0px),var(--tg-content-safe-area-inset-bottom,0px))}
+--link:var(--tg-theme-link-color,#7c9cff);--safe:max(env(safe-area-inset-bottom,0px),var(--tg-content-safe-area-inset-bottom,0px))}
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;-webkit-user-select:none;user-select:none}
 button,input{font:inherit;color:inherit}button{cursor:pointer;border:0}
-main{max-width:640px;margin:0 auto;padding:calc(12px + var(--adtop)) 14px 24px;transition:padding-top .25s}body.bar main{padding-bottom:96px}
+main{max-width:640px;margin:0 auto;padding:12px 14px 24px}body.bar main{padding-bottom:96px}
 [hidden]{display:none!important}
 h1{font-size:20px;margin:6px 0 10px}.hint{color:var(--hint);font-size:13px}
-.search{position:sticky;top:var(--adtop);transition:top .25s;z-index:5;background:var(--bg);padding:8px 0}
+.search{position:sticky;top:0;z-index:5;background:var(--bg);padding:8px 0}
 .search input{width:100%;padding:12px 14px;border-radius:12px;border:0;background:var(--sec);outline:none;-webkit-user-select:text;user-select:text}
 .tabs{display:flex;gap:8px;margin:4px 0 8px}.tabs button{background:var(--sec);padding:7px 14px;border-radius:999px;font-size:14px;color:var(--hint)}
 .tabs button.on{background:var(--btn);color:var(--btx)}
@@ -40,7 +40,7 @@ h1{font-size:20px;margin:6px 0 10px}.hint{color:var(--hint);font-size:13px}
 #bar .t b{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:14px}#bar .t span{color:var(--hint);font-size:12px}
 #bar .pp{width:42px;height:42px;border-radius:50%;background:var(--btn);color:var(--btx);font-size:16px;flex:none}
 #bar .pg{position:absolute;left:0;top:0;height:2px;background:var(--btn);width:0}
-#full{position:fixed;inset:0;background:var(--bg);z-index:20;overflow:auto;padding:calc(14px + var(--adtop)) 22px calc(24px + var(--safe));transform:translateY(100%);transition:transform .25s}
+#full{position:fixed;inset:0;background:var(--bg);z-index:20;overflow:auto;padding:14px 22px calc(24px + var(--safe));transform:translateY(100%);transition:transform .25s}
 #full.open{transform:none}#full .w{max-width:420px;margin:0 auto;text-align:center}
 .art{font-size:64px;margin:18px 0 6px}.ft{font-size:20px;font-weight:600}.fe{color:var(--hint);margin-bottom:22px}
 input[type=range]{width:100%;accent-color:var(--btn);height:28px}.tm{display:flex;justify-content:space-between;color:var(--hint);font-size:13px}
@@ -48,13 +48,17 @@ input[type=range]{width:100%;accent-color:var(--btn);height:28px}.tm{display:fle
 .row button{background:var(--sec);border-radius:50%;width:48px;height:48px;font-size:14px}.row button:disabled{opacity:.35}
 .row #fpp{width:68px;height:68px;font-size:24px;background:var(--btn);color:var(--btx)}
 .opts{display:flex;justify-content:center;gap:10px}.opts button{background:var(--sec);padding:8px 14px;border-radius:999px;font-size:13px}
-#toast{position:fixed;left:50%;bottom:calc(90px + var(--safe));transform:translateX(-50%);background:#000c;color:#fff;padding:10px 16px;border-radius:12px;font-size:14px;z-index:40;max-width:86%;text-align:center}
-#gate{position:fixed;inset:0;background:var(--bg);z-index:50;display:flex;align-items:center;justify-content:center;text-align:center;padding:28px}
-#gate .b{max-width:340px}#gate p{white-space:pre-line}#gate .primary,#gate .ghost{display:block;width:100%;margin-top:10px}
+#toast{position:fixed;left:50%;bottom:calc(90px + var(--safe));transform:translateX(-50%);background:#000c;color:#fff;padding:10px 16px;border-radius:12px;font-size:14px;z-index:70;max-width:86%;text-align:center}
+#gate,#wall{position:fixed;inset:0;background:var(--bg);z-index:50;display:flex;align-items:center;justify-content:center;text-align:center;padding:28px}
+#gate .b,#wall .b{max-width:340px}#gate p,#wall p{white-space:pre-line}#gate .primary,#gate .ghost,#wall .primary{display:block;width:100%;margin-top:10px}
+#wall{z-index:55}#wall h2{margin:6px 0 10px;font-size:20px}#wall .primary:disabled,.passbar button:disabled{opacity:.6}
+.passbar{display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--sec);border-radius:12px;padding:8px 12px;margin:0 0 8px;font-size:13px}
+.passbar button{padding:6px 12px;border-radius:999px;background:var(--btn);color:var(--btx);font-size:13px;font-weight:600}
 </style></head><body>
 <main>
  <section id="home">
   <h1>🎧 AUDIOS FM</h1>
+  <div class="passbar" id="pass" hidden><span id="passT"></span><button id="passX">+ time</button></div>
   <div class="search"><input id="q" type="search" placeholder="Search series…" autocomplete="off" enterkeyhint="search"></div>
   <div class="tabs"><button id="tNew" class="on">Latest</button><button id="tAz">A–Z</button></div>
   <button id="cont" class="card cont" hidden><b></b><span></span></button>
@@ -88,6 +92,7 @@ input[type=range]{width:100%;accent-color:var(--btn);height:28px}.tm{display:fle
 </div></div>
 
 <div id="gate" hidden><div class="b"><h1>🔒</h1><p id="gateMsg"></p><div id="gateLinks"></div><button class="ghost" id="gateRetry">Try again</button></div></div>
+<div id="wall" hidden><div class="b"><h1>🎁</h1><h2>Listen free</h2><p id="wallMsg"></p><button class="primary" id="wallGo">▶ Watch ad &amp; unlock</button><p class="hint" id="wallHint" style="margin-top:14px"></p></div></div>
 <div id="toast" hidden></div>
 <audio id="a" preload="auto"></audio>
 
@@ -107,12 +112,46 @@ async function api(path,body){
  const r=await fetch(path,{method:body?'POST':'GET',headers:{'X-Init-Data':initData,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
  let j=null;try{j=await r.json()}catch(e){}
  if(r.status===401){fatal(initData?'Your session expired. Close this window and open the app again from the bot.':'Please open this app from Telegram (use the Open app button in the bot).');throw new Error('auth')}
- if(r.status===403&&j&&j.error==='gate'){showGate(j);throw new Error('gate')}
+ if(r.status===403&&j&&j.error==='gate'){if(j.adwall){if(cfg.reward)cfg.reward.rem=0;armPass();showWall('Your free time is up.')}else showGate(j);throw new Error('gate')}
  if(!r.ok){const e=new Error((j&&j.msg)||'Something went wrong. Try again.');e.status=r.status;throw e}
  return j}
 
 /* ---------- ads (only if /setad has code) ---------- */
 function mountAd(id){const box=$(id);if(!cfg.ad||box.firstChild)return;box.innerHTML='<small>Advertisement</small><iframe src="/adframe" loading="lazy" sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" style="height:'+(+cfg.adh||280)+'px"></iframe>'}
+
+/* ---------- rewarded ads: watch an ad, listen free for a while (only if the server turned it on) ---------- */
+let passEnd=0,passT=null,chipT=null,adBusy=false,sdkP=null,inappOn=false,started=false;
+const remainSec=()=>Math.max(0,Math.round((passEnd-Date.now())/1000));
+function fmtLeft(s){const m=Math.max(1,Math.ceil(s/60));return m>=60?Math.floor(m/60)+' h'+(m%60?' '+m%60+' min':''):m+' min'}
+function loadSdk(){const R=cfg.reward,fn='show_'+(R&&R.zone);if(!R||!R.zone)return Promise.resolve(false);
+ if(typeof window[fn]==='function')return Promise.resolve(true);if(sdkP)return sdkP;
+ sdkP=new Promise(res=>{const el=document.createElement('script');el.src=R.sdk;el.async=true;el.dataset.zone=R.zone;el.dataset.sdk=fn;
+  el.onload=()=>res(typeof window[fn]==='function');el.onerror=()=>res(false);document.head.appendChild(el)}).then(ok=>{if(!ok)sdkP=null;return ok});
+ return sdkP}
+function chip(){const R=cfg.reward,box=$('pass');if(!R||!R.on||!R.free||remainSec()<=0){box.hidden=true;return}
+ box.hidden=false;$('passT').textContent='⏱ '+fmtLeft(remainSec())+' of free listening left';$('passX').hidden=remainSec()>=R.mins*60}
+function armPass(){clearTimeout(passT);clearInterval(chipT);const R=cfg.reward;if(!R||!R.on||!R.free)return;
+ passEnd=Date.now()+(R.rem||0)*1000;chip();chipT=setInterval(chip,20000);
+ if(remainSec()>0)passT=setTimeout(()=>{A.pause();chip();showWall('Your free time is up.')},remainSec()*1000+300)}
+function showWall(why){const R=cfg.reward||{};$('wallMsg').textContent=(why?why+'\n\n':'')+'Watch a short ad to listen free for '+(R.mins||60)+' minutes.';
+ $('wallHint').textContent=R.contact?'No ads? '+R.contact:'';$('wallGo').disabled=false;$('wallGo').textContent='▶ Watch ad & unlock';$('wall').hidden=false}
+async function watchAd(){
+ const R=cfg.reward;if(!R||!R.on||adBusy)return;adBusy=true;
+ const go=$('wallGo'),x=$('passX');go.disabled=x.disabled=true;go.textContent='Loading ad…';
+ try{
+  const ok=await loadSdk(),s=await api('/api/ad/start',{});let failed=!ok;
+  if(ok){try{await window['show_'+R.zone]()}catch(e){failed=true}}
+  go.textContent='Unlocking…';
+  const j=await api('/api/ad/claim',{token:s.token,failed});
+  if(!j.ok){toast(j.msg||'Could not unlock. Try again.');return}
+  R.rem=j.rem;armPass();$('wall').hidden=true;
+  toast(j.kind==='grace'?'No ad available right now - here are '+fmtLeft(j.rem)+' free.':'✅ Unlocked '+fmtLeft(j.rem)+' of listening');
+  startApp()}
+ catch(e){if(e.message!=='auth'&&e.message!=='gate')toast(e.message)}
+ finally{adBusy=false;go.disabled=x.disabled=false;go.textContent='▶ Watch ad & unlock'}}
+$('wallGo').onclick=watchAd;$('passX').onclick=watchAd;
+function startInApp(){const R=cfg.reward;if(inappOn||!R||!R.inapp||remainSec()<=0)return;inappOn=true;  /* optional automatic ads for free users (AD_INAPP) */
+ loadSdk().then(ok=>{if(ok)try{window['show_'+R.zone]({type:'inApp',inAppSettings:R.inapp})}catch(e){}})}
 
 /* ---------- views ---------- */
 let view='home',homeY=0,S=null;
@@ -213,25 +252,17 @@ function media(){if(!('mediaSession' in navigator)||!cur)return;
   m.setActionHandler('previoustrack',()=>step(-1));m.setActionHandler('nexttrack',()=>step(1))}catch(e){}}
 document.addEventListener('contextmenu',e=>e.preventDefault());
 
-/* ---------- keep our page below ad-network overlays (in-page push banners etc.) ---------- */
-(function(){
- const ours=e=>!e||e===document.body||e===document.documentElement||e.closest('main,#bar,#full,#gate,#toast');
- let cur=0;
- function measure(){
-  if(document.hidden)return;
-  const x=Math.round(innerWidth/2);let low=0;
-  for(let y=0;y<=400;y+=8){if(!ours(document.elementFromPoint(x,y)))low=y+8}
-  if(Math.abs(low-cur)>=4){cur=low;document.documentElement.style.setProperty('--adtop',low+'px')}
- }
- setTimeout(measure,300);setInterval(measure,600);
-})();
-
 /* ---------- start ---------- */
-(async function(){
- if(!initData){fatal('Please open this app from Telegram (use the Open app button in the bot).');return}
- try{cfg=await api('/api/config')}catch(e){return}
+function startApp(){
+ if(started)return;started=true;
  const last=LS.get('last',null);
  if(last){const c=$('cont');c.firstChild.textContent='Continue: '+last.title;c.lastChild.textContent='Episode '+last.seq;c.hidden=false;
   c.onclick=async()=>{await openSeries(last.sid,last.title);playEpisode(last.sid,last.seq,last.title)}}
- loadList(true)})();
+ startInApp();loadList(true)}
+(async function(){
+ if(!initData){fatal('Please open this app from Telegram (use the Open app button in the bot).');return}
+ try{cfg=await api('/api/config')}catch(e){return}
+ const R=cfg.reward;
+ if(R&&R.on&&R.free){armPass();loadSdk();if(R.rem<=0){showWall('');return}}
+ startApp()})();
 </script></body></html>
