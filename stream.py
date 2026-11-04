@@ -167,6 +167,15 @@ async def home(request):
     return web.Response(text=page, content_type="text/html", headers={"Cache-Control": "no-cache"})
 
 
+def player_csp():
+    """Strict CSP by default. If a head tag (e.g. Monetag zone script) is set with /sethead, allow https scripts/frames so the ad network can load."""
+    if head_html():
+        return ("default-src 'self' https: data: blob:; style-src 'unsafe-inline' https:; "
+                "script-src 'unsafe-inline' 'unsafe-eval' https:; img-src https: data: blob:; "
+                "connect-src 'self' https: wss:; frame-src https:; media-src 'self'")
+    return "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; media-src 'self'"
+
+
 # ------------------------------------------------------------ player page
 PLAYER = """<!doctype html><html lang=en><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><meta name=robots content=noindex>
@@ -245,7 +254,7 @@ async def player(request):
             .replace("@@NEXTLINK@@", f'<a href="{next_url}">Next ▶</a>' if next_url else "<span>Next ▶</span>"))
     resp = web.Response(text=page, content_type="text/html", headers={
         "Cache-Control": "no-store", "X-Robots-Tag": "noindex", "X-Content-Type-Options": "nosniff",
-        "Content-Security-Policy": "default-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; media-src 'self'"})
+        "Content-Security-Policy": player_csp()})
     if new_cookie:
         resp.set_cookie(_cookie_name(tok), new_cookie, max_age=max(exp - int(time.time()), 60), httponly=True,
                         secure=True, samesite="Lax", path="/")
