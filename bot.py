@@ -218,11 +218,14 @@ def help_text(is_admin):
             "/stories - list story ids (named / unnamed)\n"
             "/name <story id> <title> - give a story its name (needed for search)\n"
             "/swap <story id> <a> <b> - swap two episode numbers\n"
+            "/delete <story id> <eps> - delete one, a range (10-25), several (3 7 10-15) or all\n"
+            "/renumber <story id> - close gaps in episode numbers after deleting\n"
             "/grant <telegram id> <days> - give/extend access\n"
             "/revoke <telegram id> - remove access\n"
             "/subs - list paid users\n"
             "/clearcache - forget cached Telegram files\n"
             "/forcesub - check the force-join channel setup\n"
+            "/setad <ad code> - show an ad on the player page (/setad off to remove)\n"
             "/requests - pending user requests\n"
             "/reqdone <request id> - mark a request as added (notifies the user)\n"
             "/stats\n\nAdmins don't need a subscription."
@@ -338,6 +341,170 @@ async def cmd_swap(update, context):
     await update.message.reply_text(f"✅ Swapped Ep {x} and Ep {y}.")
 
 
+# ------------------------------------------------------------ mass delete / renumber
+PENDING_TTL = 300  # a delete confirmation stays valid for 5 minutes
+
+
+def parse_eps(tokens, existing):
+    """'3 5-9, 12' -> sorted list of episode numbers that exist. 'all' = every episode. None if unreadable."""
+    text = " ".join(tokens).lower().replace(",", " ")
+    if text.strip() == "all":
+        return sorted(existing)
+    wanted = set()
+    for part in text.split():
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", part)
+        if not m:
+            return None
+        lo, hi = int(m.group(1)), int(m.group(2) or m.group(1))
+        if hi < lo:
+            lo, hi = hi, lo
+        wanted.update(range(lo, hi + 1))
+    return sorted(wanted & set(existing))
+
+
+def compact(nums):
+    """[1,2,3,7,9,10] -> '1-3, 7, 9-10'"""
+    out, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out.append(str(nums[i]) if i == j else f"{nums[i]}-{nums[j]}")
+        i = j + 1
+    return ", ".join(out)
+
+
+@admin_cmd
+async def cmd_delete(update, context):
+    a = context.args
+    if len(a) < 2 or not a[0].isdigit():
+        await update.message.reply_text(
+            "Usage: /delete <story id> <episodes>\n\n"
+            "Examples:\n/delete 12 45 - one episode\n/delete 12 10-25 - a range\n"
+            "/delete 12 3 7 10-15 - several\n/delete 12 all - every episode of the story (and the story itself)\n\n"
+            "You will be asked to confirm before anything is removed.")
+        return
+    sid = int(a[0])
+    with closing(db()) as con:
+        s = con.execute("SELECT title FROM stories WHERE story_id=?", (sid,)).fetchone()
+        rows = con.execute("SELECT seq, key FROM episodes WHERE story_id=? ORDER BY seq", (sid,)).fetchall()
+    if not s and not rows:
+        await update.message.reply_text("Story id not found (see /stories).")
+        return
+    whole = " ".join(a[1:]).strip().lower() == "all"
+    seqs = parse_eps(a[1:], [r["seq"] for r in rows])
+    if seqs is None:
+        await update.message.reply_text("Couldn't read the episode list. Use numbers and ranges like: 5 8-12 20")
+        return
+    if not seqs and not whole:
+        await update.message.reply_text("None of those episode numbers exist in that story.")
+        return
+    chosen = [r for r in rows if r["seq"] in set(seqs)]
+    n_tg = sum(1 for r in chosen if r["key"].startswith("tg/"))
+    context.user_data["pending_delete"] = {"sid": sid, "seqs": seqs, "whole": whole, "ts": time.time()}
+    title = (s["title"] if s and s["title"] else f"Story {sid}")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🗑 Yes, delete", callback_data="del:ok"),
+                                InlineKeyboardButton("Cancel", callback_data="del:no")]])
+    await update.message.reply_text(
+        f"⚠️ Delete from {title} (story {sid})?\n\n"
+        f"Episodes: {compact(seqs) if seqs else 'none'} ({len(seqs)} total)\n"
+        f"Stored in R2: {len(chosen) - n_tg}   Stored in Telegram channel: {n_tg}\n"
+        + ("The story name will be removed too.\n" if whole else "")
+        + "\nThis permanently removes the audio files and cannot be undone.", reply_markup=kb)
+
+
+def _r2_delete(keys):
+    """Delete R2 objects. Returns the set of keys that failed."""
+    failed = set()
+    for i in range(0, len(keys), 1000):
+        batch = keys[i:i + 1000]
+        try:
+            resp = s3.delete_objects(Bucket=R2_BUCKET, Delete={"Objects": [{"Key": k} for k in batch], "Quiet": True})
+            failed.update(e["Key"] for e in resp.get("Errors", []))
+        except Exception:  # some boto3/R2 combinations reject bulk delete - fall back to one by one
+            for k in batch:
+                try:
+                    s3.delete_object(Bucket=R2_BUCKET, Key=k)
+                except Exception:
+                    log.exception("R2 delete failed for %s", k)
+                    failed.add(k)
+    return failed
+
+
+async def delete_callback(update, context):
+    q = update.callback_query
+    if q.from_user.id not in ADMIN_IDS:
+        return
+    pend = context.user_data.pop("pending_delete", None)
+    if q.data == "del:no":
+        await q.edit_message_text("Cancelled. Nothing was deleted.")
+        return
+    if not pend or time.time() - pend["ts"] > PENDING_TTL:
+        await q.edit_message_text("That confirmation expired. Run /delete again.")
+        return
+    sid, seqs, whole = pend["sid"], pend["seqs"], pend["whole"]
+    await q.edit_message_text("⏳ Deleting...")
+    async with ADD_LOCK:  # don't renumber/insert while an upload is being saved
+        with closing(db()) as con:
+            rows = [r for r in con.execute("SELECT key, seq, tg_chat, tg_msg FROM episodes WHERE story_id=?", (sid,)).fetchall()
+                    if r["seq"] in set(seqs)]
+        r2_keys = [r["key"] for r in rows if not r["key"].startswith("tg/")]
+        r2_failed = await asyncio.to_thread(_r2_delete, r2_keys) if r2_keys else set()
+        tg_failed = 0
+        for n, r in enumerate([r for r in rows if r["key"].startswith("tg/")], 1):
+            if r["tg_chat"] and r["tg_msg"]:
+                try:
+                    await context.bot.delete_message(r["tg_chat"], r["tg_msg"])
+                except Exception as e:
+                    tg_failed += 1
+                    log.warning("could not delete channel message %s: %s", r["tg_msg"], e)
+                await asyncio.sleep(0.06)  # stay under Telegram's rate limit
+            if n % 50 == 0:
+                try:
+                    await q.edit_message_text(f"⏳ Deleting... {n} channel messages done")
+                except Exception:
+                    pass
+        done = [r["key"] for r in rows if r["key"] not in r2_failed]
+        with closing(db()) as con:
+            con.executemany("DELETE FROM episodes WHERE key=?", [(k,) for k in done])
+            left = con.execute("SELECT seq FROM episodes WHERE story_id=? ORDER BY seq", (sid,)).fetchall()
+            if whole and not left:
+                con.execute("DELETE FROM stories WHERE story_id=?", (sid,))
+            con.commit()
+    left = [r["seq"] for r in left]
+    msg = f"✅ Deleted {len(done)} episode(s) from story {sid}."
+    if r2_failed:
+        msg += f"\n⚠️ {len(r2_failed)} R2 file(s) could not be deleted and were kept (try again)."
+    if tg_failed:
+        msg += f"\n⚠️ {tg_failed} message(s) couldn't be removed from the storage channel (already gone, or the bot lacks delete rights) - the episodes are removed from the bot anyway."
+    if left and left != list(range(1, len(left) + 1)):
+        msg += f"\n\nEpisode numbers now have gaps ({compact(left)}). Run /renumber {sid} to make them 1..{len(left)} again, or leave as is."
+    await q.edit_message_text(msg)
+
+
+@admin_cmd
+async def cmd_renumber(update, context):
+    if len(context.args) != 1 or not context.args[0].isdigit():
+        await update.message.reply_text("Usage: /renumber <story id>\nCloses gaps so episodes are numbered 1, 2, 3... in their current order.")
+        return
+    sid = int(context.args[0])
+    async with ADD_LOCK:
+        with closing(db()) as con:
+            seqs = [r["seq"] for r in con.execute("SELECT seq FROM episodes WHERE story_id=? ORDER BY seq", (sid,))]
+            if not seqs:
+                await update.message.reply_text("That story has no episodes.")
+                return
+            if seqs == list(range(1, len(seqs) + 1)):
+                await update.message.reply_text("Already numbered 1..%d, nothing to do." % len(seqs))
+                return
+            con.execute("UPDATE episodes SET seq=-seq WHERE story_id=?", (sid,))  # park out of the way (UNIQUE story_id+seq)
+            for new, old in enumerate(seqs, 1):
+                con.execute("UPDATE episodes SET seq=? WHERE story_id=? AND seq=?", (new, sid, -old))
+            con.commit()
+    await update.message.reply_text(f"✅ Story {sid} renumbered: {len(seqs)} episode(s), now Ep 1-{len(seqs)}.")
+
+
+
 @admin_cmd
 async def cmd_grant(update, context):
     if len(context.args) != 2 or not context.args[0].isdigit() or not context.args[1].isdigit():
@@ -381,6 +548,38 @@ async def cmd_clearcache(update, context):
         con.execute("UPDATE episodes SET file_id=NULL, kind=NULL")
         con.commit()
     await update.message.reply_text("🧹 Cache cleared.")
+
+
+@admin_cmd
+async def cmd_setad(update, context):
+    parts = (update.message.text or "").split(None, 1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if not stream.ENABLED:
+        await update.message.reply_text("The streaming player is off (STREAM_BASE_URL / STREAM_SECRET not set), so there is nowhere to show an ad.")
+        return
+    if not arg:
+        cur = stream.ad_html()
+        await update.message.reply_text(
+            ("📢 Player ad: ON (" + str(len(cur)) + " characters of code)" if cur else "📢 Player ad: OFF") +
+            "\n\nSet it: /setad <paste the full ad code here>\nRemove it: /setad off")
+        return
+    try:
+        if arg.lower() == "off":
+            if os.path.exists(stream.AD_FILE):
+                os.remove(stream.AD_FILE)
+            await update.message.reply_text("📢 Player ad removed.")
+            return
+        if len(arg) > 4000:
+            await update.message.reply_text("That code is too long for one message. Put it in the file " + stream.AD_FILE + " on the server instead.")
+            return
+        tmp = stream.AD_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(arg)
+        os.replace(tmp, stream.AD_FILE)
+        await update.message.reply_text("📢 Player ad saved. It shows on the player page from the next time a link is opened.")
+    except Exception as e:
+        log.exception("setad failed")
+        await update.message.reply_text(f"❌ Could not save: {e}")
 
 
 @admin_cmd
@@ -522,6 +721,35 @@ async def add_via_telegram(update, context, media, sid):
     await status.edit_text(note)
 
 
+# ------------------------------------------------------------ sequential upload queue
+# Files are processed ONE AT A TIME in the order they were sent (Telegram message id), so a mass upload
+# gets Ep n, n+1, n+2... exactly in sending order, whatever the download/upload speed of each file.
+UPLOAD_Q = []          # heap of (message_id, counter, job)
+_upload_counter = [0]
+_upload_task = [None]
+
+
+def enqueue_upload(message_id, job):
+    import heapq
+    _upload_counter[0] += 1
+    heapq.heappush(UPLOAD_Q, (message_id, _upload_counter[0], job))
+    if _upload_task[0] is None or _upload_task[0].done():
+        _upload_task[0] = asyncio.get_running_loop().create_task(upload_worker())
+
+
+async def upload_worker():
+    import heapq
+    await asyncio.sleep(0.8)  # let files that arrived in the same instant line up in message-id order
+    while UPLOAD_Q:
+        _, _, job = heapq.heappop(UPLOAD_Q)
+        try:
+            await job()
+        except Exception:
+            log.exception("upload job crashed")
+        if not UPLOAD_Q:
+            await asyncio.sleep(0.8)  # next file of a mass upload may be a moment behind
+
+
 async def on_file(update, context):
     if update.effective_user.id not in ADMIN_IDS:
         return
@@ -542,13 +770,21 @@ async def on_file(update, context):
     if not sid:
         await m.reply_text("Which story? Use /addto <story id> first, or put the story id as the file caption.")
         return
-    if STORAGE_CHANNEL:
-        await add_via_telegram(update, context, media, sid)
-        return
-    if (media.file_size or 0) > TG_DOWNLOAD_MAX:
+    if not STORAGE_CHANNEL and (media.file_size or 0) > TG_DOWNLOAD_MAX:
         await m.reply_text(f"❌ {name or 'File'} is {media.file_size / 1048576:.1f} MB. Bots can only download up to 20 MB - "
                            f"upload this one straight to R2 as audio/{sid}/<file>{ext} and run /sync.")
         return
+    # Queue it. NOTHING may be awaited before this line: updates run concurrently, so the queue (sorted by Telegram
+    # message id = the order you sent the files) is what guarantees Ep numbers follow your sending order.
+    if STORAGE_CHANNEL:
+        job = lambda: add_via_telegram(update, context, media, sid)
+    else:
+        job = lambda: add_via_r2(update, context, media, sid, ext)
+    enqueue_upload(m.message_id, job)
+
+
+async def add_via_r2(update, context, media, sid, ext):
+    m = update.message
     status = await m.reply_text("⏳ Uploading to R2...")
     try:
         f = await context.bot.get_file(media.file_id)
@@ -701,6 +937,9 @@ async def on_callback(update, context):
     action, _, val = q.data.partition(":")
     if action != "fsub":
         await q.answer()
+    if action == "del":
+        await delete_callback(update, context)
+        return
     ok, msg = await check_access(q.from_user.id)
     if not ok:
         if action == "fsub":
@@ -853,8 +1092,8 @@ def main():
     for name, fn in [("start", cmd_start), ("help", cmd_help), ("status", cmd_status), ("sync", cmd_sync),
                      ("stories", cmd_stories), ("name", cmd_name), ("swap", cmd_swap), ("grant", cmd_grant),
                      ("revoke", cmd_revoke), ("subs", cmd_subs), ("clearcache", cmd_clearcache), ("stats", cmd_stats),
-                     ("addto", cmd_addto), ("done", cmd_done),
-                     ("forcesub", cmd_forcesub), ("list", cmd_list), ("request", cmd_request), ("requests", cmd_requests), ("reqdone", cmd_reqdone)]:
+                     ("addto", cmd_addto), ("done", cmd_done), ("delete", cmd_delete), ("renumber", cmd_renumber),
+                     ("forcesub", cmd_forcesub), ("setad", cmd_setad), ("list", cmd_list), ("request", cmd_request), ("requests", cmd_requests), ("reqdone", cmd_reqdone)]:
         app.add_handler(CommandHandler(name, fn, filters=priv))
     app.add_handler(MessageHandler((filters.AUDIO | filters.Document.ALL) & priv, on_file))
     app.add_handler(CallbackQueryHandler(on_callback))

@@ -30,6 +30,8 @@ PORT = int(os.environ.get("STREAM_PORT", "8080"))
 RATE = max(int(os.environ.get("STREAM_RATE_KBPS", "80")), 16) * 1024   # bytes/second after the initial burst
 MAX_DEVICES = max(int(os.environ.get("STREAM_MAX_DEVICES", "2")), 1)    # browsers that may use one link
 SESSION_SECONDS = int(os.environ.get("STREAM_SESSION_MIN", "90")) * 60  # lifetime of prev/next links
+AD_FILE = os.environ.get("STREAM_AD_FILE", "ad.html")        # ad network code (set with /setad in the bot)
+AD_HEIGHT = int(os.environ.get("STREAM_AD_HEIGHT", "280"))    # 280 fits a 300x250 banner, use 60 for 320x50
 BURST = 1_000_000   # bytes sent at full speed so playback starts instantly
 CHUNK = 64 * 1024
 
@@ -38,6 +40,21 @@ CLAIMS = {}  # token -> list of cookie values (browsers that opened it)
 CTYPES = {".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".aac": "audio/aac", ".wav": "audio/wav", ".ogg": "audio/ogg",
           ".opus": "audio/ogg", ".webm": "audio/webm", ".flac": "audio/flac"}
 RANGE_RE = re.compile(r"^bytes=\d*-\d*$")
+
+
+_ad_cache = {"mtime": None, "html": ""}
+
+
+def ad_html():
+    """Ad code pasted by the admin (empty string = no ad). Re-read only when the file changes."""
+    try:
+        mtime = os.stat(AD_FILE).st_mtime
+        if _ad_cache["mtime"] != mtime:
+            with open(AD_FILE, encoding="utf-8") as f:
+                _ad_cache.update(mtime=mtime, html=f.read().strip())
+        return _ad_cache["html"]
+    except OSError:
+        return ""
 
 
 def configure(db, s3, bucket, check_access):
@@ -138,12 +155,14 @@ button{background:#1b1f29;color:#e8e8ea;border:0;border-radius:50%;width:48px;he
 #b{width:68px;height:68px;font-size:24px;background:#7c9cff;color:#0f1115}
 .nav{display:flex;justify-content:space-between;margin-top:8px}.nav a{color:#7c9cff;text-decoration:none;padding:10px 4px}
 .nav span{color:#444b59;padding:10px 4px}.n{color:#6b7280;font-size:12px;margin-top:26px}
+.ad{margin-top:22px}.ad small{display:block;color:#6b7280;font-size:11px;margin-bottom:4px}
+.ad iframe{border:0;width:100%;max-width:340px;height:@@ADH@@px;background:transparent}
 </style></head><body data-next="@@NEXT@@"><main>
 <div class=t>@@TITLE@@</div><div class=e>Episode @@SEQ@@</div>
 <audio id=a src="/a/@@TOK@@" preload=auto controlsList="nodownload"></audio>
 <input type=range id=s min=0 max=1000 value=0><div class=tm><span id=c>0:00</span><span id=d>0:00</span></div>
 <div class=row><button id=bk>-15</button><button id=b>▶</button><button id=fw>+15</button><button id=sp>1x</button></div>
-<div class=nav>@@PREV@@@@NEXTLINK@@</div><div class=n>Streaming link - expires @@EXP@@ min after you open it</div></main>
+<div class=nav>@@PREV@@@@NEXTLINK@@</div>@@AD@@<div class=n>Streaming link - expires @@EXP@@ min after you open it</div></main>
 <script>
 const a=document.getElementById('a'),b=document.getElementById('b'),s=document.getElementById('s'),
 c=document.getElementById('c'),d=document.getElementById('d'),sp=document.getElementById('sp'),KEY='pos:@@SID@@:@@SEQ@@';
@@ -188,6 +207,10 @@ async def player(request):
     page = (PLAYER.replace("@@TITLE@@", html.escape(title)).replace("@@SEQ@@", str(seq)).replace("@@SID@@", str(sid))
             .replace("@@TOK@@", tok).replace("@@EXP@@", str(SESSION_SECONDS // 60)).replace("@@NEXT@@", next_url)
             .replace("@@PREV@@", f'<a href="{prev_url}">◀ Prev</a>' if prev_url else "<span>◀ Prev</span>")
+            .replace("@@ADH@@", str(AD_HEIGHT))
+            .replace("@@AD@@", (f'<div class=ad><small>Advertisement</small><iframe src="/ad/{tok}" loading=lazy '
+                                'sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" '
+                                'referrerpolicy="origin"></iframe></div>') if ad_html() else "")
             .replace("@@NEXTLINK@@", f'<a href="{next_url}">Next ▶</a>' if next_url else "<span>Next ▶</span>"))
     resp = web.Response(text=page, content_type="text/html", headers={
         "Cache-Control": "no-store", "X-Robots-Tag": "noindex", "X-Content-Type-Options": "nosniff",
@@ -196,6 +219,24 @@ async def player(request):
         resp.set_cookie(_cookie_name(tok), new_cookie, max_age=max(exp - int(time.time()), 60), httponly=True,
                         secure=True, samesite="Lax", path="/")
     return resp
+
+
+# ------------------------------------------------------------ ad frame (sandboxed: ad scripts can't touch the player)
+async def ad_frame(request):
+    tok = request.match_info["tok"]
+    info, err = await _authorize(tok)
+    if err:
+        return err
+    code = ad_html()
+    if not code:
+        return web.Response(status=204)
+    page = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<style>html,body{margin:0;background:transparent;display:flex;justify-content:center}</style>" + code)
+    return web.Response(text=page, content_type="text/html", headers={
+        "Cache-Control": "no-store", "X-Robots-Tag": "noindex",
+        # opaque origin: no cookies, no access to the parent page or the audio, popups allowed for ad clicks
+        "Content-Security-Policy": "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox; "
+                                   "default-src * data: blob: 'unsafe-inline' 'unsafe-eval'"})
 
 
 # ------------------------------------------------------------ audio (throttled, range-capable)
@@ -263,6 +304,7 @@ async def start(_application=None):
     app = web.Application()
     app.router.add_get("/p/{tok}", player)
     app.router.add_get("/a/{tok}", audio)
+    app.router.add_get("/ad/{tok}", ad_frame)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     await web.TCPSite(runner, "127.0.0.1", PORT).start()
