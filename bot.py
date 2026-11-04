@@ -16,9 +16,11 @@ from datetime import datetime
 
 import boto3
 from botocore.config import Config
+
+import stream
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import (
-    Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
+    Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters,
 )
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
@@ -32,6 +34,8 @@ MAX_RANGE = int(os.environ.get("MAX_RANGE", "30"))
 TG_MAX_BYTES = int(os.environ.get("TG_MAX_BYTES", str(49 * 1024 * 1024)))  # Bot API upload limit ~50 MB
 CONTACT_TEXT = os.environ.get("CONTACT_TEXT", "Contact the admin to subscribe.")
 DB_PATH = os.environ.get("DB_PATH", "bot.db")
+# If set (e.g. -1001234567890), new episodes added with /addto are stored in this private Telegram channel instead of R2.
+STORAGE_CHANNEL = int(os.environ["STORAGE_CHANNEL_ID"]) if os.environ.get("STORAGE_CHANNEL_ID", "").strip() else None
 # Paid-only mode is OFF by default. Set REQUIRE_SUBSCRIPTION=true in .env to turn it back on.
 REQUIRE_SUB = os.environ.get("REQUIRE_SUBSCRIPTION", "false").strip().lower() in ("1", "true", "yes", "on")
 
@@ -42,7 +46,7 @@ log = logging.getLogger("episodes-bot")
 s3 = boto3.client(
     "s3", endpoint_url=R2_ENDPOINT, aws_access_key_id=R2_KEY_ID, aws_secret_access_key=R2_SECRET,
     region_name="auto", config=Config(signature_version="s3v4", s3={"addressing_style": "path"},
-                                      retries={"max_attempts": 3}),
+                                      retries={"max_attempts": 3}, max_pool_connections=50),
 )
 KEY_RE = re.compile(r"^audio/(\d+)/[^/]+\.(mp3|m4a|aac|wav|ogg|opus|webm|flac)$", re.I)
 
@@ -66,7 +70,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS requests(
             id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, username TEXT,
             text TEXT NOT NULL, created INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending');
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY, username TEXT, name TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS plays(user_id INTEGER NOT NULL, story_id INTEGER NOT NULL, seq INTEGER NOT NULL, ts INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS plays_ts ON plays(ts);
         """)
+        cols = {r[1] for r in con.execute("PRAGMA table_info(episodes)")}
+        for col in ("tg_chat", "tg_msg"):  # Telegram-stored episodes: channel id + message id
+            if col not in cols:
+                con.execute(f"ALTER TABLE episodes ADD COLUMN {col} INTEGER")
         con.commit()
 
 
@@ -116,7 +128,7 @@ async def do_sync():
     added = removed = 0
     with closing(db()) as con:
         for (key,) in con.execute("SELECT key FROM episodes").fetchall():
-            if key not in live:
+            if key not in live and not key.startswith("tg/"):  # tg/ = stored in Telegram, not R2
                 con.execute("DELETE FROM episodes WHERE key=?", (key,))
                 removed += 1
         have = {r["key"] for r in con.execute("SELECT key FROM episodes")}
@@ -321,14 +333,52 @@ async def cmd_clearcache(update, context):
     await update.message.reply_text("🧹 Cache cleared.")
 
 
+async def track_user(update, context):
+    """Runs before every handler: remember each private-chat user and when they were last active."""
+    u = update.effective_user
+    if not u or u.is_bot or not update.effective_chat or update.effective_chat.type != "private":
+        return
+    try:
+        now = int(time.time())
+        with closing(db()) as con:
+            con.execute("INSERT INTO users(user_id, username, name, first_seen, last_seen) VALUES(?,?,?,?,?) "
+                        "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, name=excluded.name, last_seen=excluded.last_seen",
+                        (u.id, u.username, u.full_name, now, now))
+            con.commit()
+    except Exception as e:
+        log.warning("user tracking failed: %s", e)
+
+
 @admin_cmd
 async def cmd_stats(update, context):
+    now = int(time.time())
+    d1, d7, d30 = now - 86400, now - 7 * 86400, now - 30 * 86400
     with closing(db()) as con:
-        s = con.execute("SELECT COUNT(*) FROM stories").fetchone()[0]
-        n = con.execute("SELECT COUNT(*) FROM stories WHERE title IS NOT NULL").fetchone()[0]
-        e = con.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
-        a = con.execute("SELECT COUNT(*) FROM subs WHERE expires_at>?", (int(time.time()),)).fetchone()[0]
-    await update.message.reply_text(f"📊 Stories: {s} ({n} named)\nEpisodes: {e}\nActive paid users: {a}")
+        q = lambda sql, *a: con.execute(sql, a).fetchone()[0]
+        total = q("SELECT COUNT(*) FROM users")
+        new1, new7 = q("SELECT COUNT(*) FROM users WHERE first_seen>?", d1), q("SELECT COUNT(*) FROM users WHERE first_seen>?", d7)
+        act1, act7, act30 = (q("SELECT COUNT(*) FROM users WHERE last_seen>?", d) for d in (d1, d7, d30))
+        paid = q("SELECT COUNT(*) FROM subs WHERE expires_at>?", now)
+        s, n = q("SELECT COUNT(*) FROM stories"), q("SELECT COUNT(*) FROM stories WHERE title IS NOT NULL")
+        e = q("SELECT COUNT(*) FROM episodes")
+        p1, p7, pall = q("SELECT COUNT(*) FROM plays WHERE ts>?", d1), q("SELECT COUNT(*) FROM plays WHERE ts>?", d7), q("SELECT COUNT(*) FROM plays")
+        first = q("SELECT MIN(first_seen) FROM users")
+        top = con.execute("SELECT COALESCE(s.title, 'Story ' || p.story_id) t, COUNT(*) c FROM plays p LEFT JOIN stories s "
+                          "ON s.story_id=p.story_id WHERE p.ts>? GROUP BY p.story_id ORDER BY c DESC LIMIT 5", (d7,)).fetchall()
+    lines = [
+        "📊 Bot stats",
+        "",
+        f"👥 Users: {total} total" + (f" (counted since {fmt(first)})" if first else ""),
+        f"   New: {new1} today, {new7} this week",
+        f"   Active: {act1} in 24h, {act7} in 7 days, {act30} in 30 days",
+        f"   Paid (active): {paid}",
+        "",
+        f"🎧 Episodes sent: {p1} in 24h, {p7} in 7 days, {pall} total",
+        f"📚 Library: {s} stories ({n} named), {e} episodes",
+    ]
+    if top:
+        lines += ["", "🔥 Top this week:"] + [f"   {r['t']} - {r['c']}" for r in top]
+    await update.message.reply_text("\n".join(lines))
 
 
 # ------------------------------------------------------------ add episodes from the bot
@@ -357,13 +407,48 @@ async def cmd_addto(update, context):
     context.user_data["add_story"] = sid
     await update.message.reply_text(
         f"📥 Adding to story {sid}: {s['title'] or '(unnamed - use /name or /addto again with a title)'}\n"
-        f"Currently {n} episode(s). Send audio files now - next will be Ep {n + 1}.\n/done to stop.")
+        f"Currently {n} episode(s). Send audio files now - next will be Ep {n + 1}.\n"
+        f"Storage: {'Telegram channel' if STORAGE_CHANNEL else 'Cloudflare R2'}. /done to stop.")
 
 
 @admin_cmd
 async def cmd_done(update, context):
     sid = context.user_data.pop("add_story", None)
     await update.message.reply_text("✅ Stopped adding." if sid else "Nothing was being added.")
+
+
+async def add_via_telegram(update, context, media, sid):
+    """Store the episode in the private storage channel (no download, so no 20 MB limit)."""
+    m = update.message
+    status = await m.reply_text("⏳ Saving to Telegram storage...")
+    key = f"tg/{sid}/{media.file_unique_id}"
+    try:
+        async with ADD_LOCK:
+            with closing(db()) as con:
+                if con.execute("SELECT 1 FROM episodes WHERE key=?", (key,)).fetchone():
+                    await status.edit_text("⚠️ This exact file is already in that story - skipped.")
+                    return
+                con.execute("INSERT OR IGNORE INTO stories(story_id, title) VALUES(?, NULL)", (sid,))
+                con.commit()
+                seq = con.execute("SELECT COALESCE(MAX(seq),0)+1 FROM episodes WHERE story_id=?", (sid,)).fetchone()[0]
+                title = con.execute("SELECT title FROM stories WHERE story_id=?", (sid,)).fetchone()["title"]
+            cm = await context.bot.copy_message(chat_id=STORAGE_CHANNEL, from_chat_id=m.chat_id, message_id=m.message_id,
+                                                caption=f"{title or 'Story ' + str(sid)} - Ep {seq}")
+            kind = "audio" if m.audio else "document"
+            with closing(db()) as con:
+                con.execute("INSERT INTO episodes(key, story_id, seq, size, modified, file_id, kind, tg_chat, tg_msg) "
+                            "VALUES(?,?,?,?,?,?,?,?,?)",
+                            (key, sid, seq, media.file_size or 0, int(time.time()), media.file_id, kind,
+                             STORAGE_CHANNEL, cm.message_id))
+                con.commit()
+    except Exception as e:
+        log.exception("add via telegram failed")
+        await status.edit_text(f"❌ Failed: {e}\nCheck STORAGE_CHANNEL_ID and that the bot is an admin of the channel with permission to post.")
+        return
+    note = f"✅ Added to story {sid} ({title or 'unnamed'}) as Ep {seq} - saved in Telegram storage"
+    if not title:
+        note += f"\n⚠️ Story has no name yet - /name {sid} <title> so users can search it."
+    await status.edit_text(note)
 
 
 async def on_file(update, context):
@@ -385,6 +470,9 @@ async def on_file(update, context):
     sid = int(cap.split()[0]) if cap.split() and cap.split()[0].isdigit() else context.user_data.get("add_story")
     if not sid:
         await m.reply_text("Which story? Use /addto <story id> first, or put the story id as the file caption.")
+        return
+    if STORAGE_CHANNEL:
+        await add_via_telegram(update, context, media, sid)
         return
     if (media.file_size or 0) > TG_DOWNLOAD_MAX:
         await m.reply_text(f"❌ {name or 'File'} is {media.file_size / 1048576:.1f} MB. Bots can only download up to 20 MB - "
@@ -572,6 +660,12 @@ async def on_callback(update, context):
 async def send_one(context, chat_id, ep, title):
     seq = ep["seq"]
     caption = f"{title} - Ep {seq}"
+    if stream.ENABLED and not ep["key"].startswith("tg/"):  # R2 episode -> temporary streaming link, not a file
+        exp = int(time.time()) + (DELETE_AFTER if DELETE_AFTER > 0 else stream.SESSION_SECONDS)
+        url = stream.url_for(chat_id, ep["story_id"], seq, exp)
+        msg = await context.bot.send_message(chat_id, f"🎧 {caption}", protect_content=True,
+                                             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("▶ Play", url=url)]]))
+        return msg, None
     if ep["file_id"]:
         try:
             if ep["kind"] == "audio":
@@ -579,6 +673,13 @@ async def send_one(context, chat_id, ep, title):
             return await context.bot.send_document(chat_id, document=ep["file_id"], caption=caption, protect_content=True), None
         except Exception as e:
             log.warning("cached file_id failed for %s: %s", ep["key"], e)
+    if ep.get("tg_msg"):
+        try:
+            return await context.bot.copy_message(chat_id, from_chat_id=ep["tg_chat"], message_id=ep["tg_msg"],
+                                                  caption=caption, protect_content=True), None
+        except Exception as e:
+            log.error("copy from storage channel failed for %s: %s", ep["key"], e)
+            return None, f"Ep {seq}: could not send"
     if ep["size"] > TG_MAX_BYTES:
         return None, f"Ep {seq}: file is too large for Telegram bots"
     data = await asyncio.to_thread(r2_get, ep["key"])
@@ -627,6 +728,13 @@ async def send_episodes(update, context, story_id, lo, hi):
             errors.append(err)
             continue
         sent += 1
+        try:
+            with closing(db()) as con:
+                con.execute("INSERT INTO plays(user_id, story_id, seq, ts) VALUES(?,?,?,?)",
+                            (update.effective_user.id, story_id, ep["seq"], int(time.time())))
+                con.commit()
+        except Exception as e:
+            log.warning("play log failed: %s", e)
         if DELETE_AFTER > 0:
             context.job_queue.run_once(delete_job, DELETE_AFTER, data={"chat_id": chat_id, "message_id": msg.message_id})
     try:
@@ -646,8 +754,13 @@ def main():
     if not ADMIN_IDS:
         raise SystemExit("Set ADMIN_IDS in .env (your Telegram user id).")
     init_db()
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    stream.configure(db, s3, R2_BUCKET, check_access)
+    builder = Application.builder().token(BOT_TOKEN).concurrent_updates(True)
+    if stream.ENABLED:
+        builder = builder.post_init(stream.start).post_shutdown(stream.stop)
+    app = builder.build()
     priv = filters.ChatType.PRIVATE
+    app.add_handler(TypeHandler(Update, track_user), group=-1)
     for name, fn in [("start", cmd_start), ("help", cmd_help), ("status", cmd_status), ("sync", cmd_sync),
                      ("stories", cmd_stories), ("name", cmd_name), ("swap", cmd_swap), ("grant", cmd_grant),
                      ("revoke", cmd_revoke), ("subs", cmd_subs), ("clearcache", cmd_clearcache), ("stats", cmd_stats),
@@ -657,7 +770,7 @@ def main():
     app.add_handler(MessageHandler((filters.AUDIO | filters.Document.ALL) & priv, on_file))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & priv, on_text))
-    log.info("Bot started")
+    log.info("Bot started (streaming %s)", "ON" if stream.ENABLED else "off")
     app.run_polling()
 
 
