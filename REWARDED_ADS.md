@@ -1,7 +1,9 @@
 # Ad-unlock: watch an ad, listen free for a limited time
 
+> This package uses **Adsgram**. Setup steps are in `ADSGRAM_SETUP.md`; the rest of this page still applies.
+
 Users who are not admins and have no paid subscription (`/grant`) see a **"Watch ad & unlock"** screen in the Mini App.
-When the Monetag Rewarded Interstitial finishes, they can listen for `AD_PASS_MINUTES` minutes (default 60).
+When the Adsgram Reward ad finishes, they can listen for `AD_PASS_MINUTES` minutes (default 60).
 A small bar on the home screen shows the time left, with a **+ time** button to watch another ad before it runs out.
 Paid users and admins never see any of this.
 
@@ -43,13 +45,12 @@ used the bot freely before.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `AD_REWARD_ZONE` | empty (off) | Your Monetag Rewarded Interstitial zone id |
+| `ADSGRAM_BLOCK_ID` | empty (off) | Your Adsgram **Reward** block id (digits only) |
 | `AD_PASS_MINUTES` | 60 | Listening time per ad |
 | `AD_MAX_PER_DAY` | 12 | Ads that count per user per 24 h |
 | `AD_MIN_WATCH_SECONDS` | 5 | "Ad finished" reports faster than this are refused |
 | `AD_GRACE_MINUTES` / `AD_GRACE_PER_DAY` | 5 / 2 | Fallback pass when no ad could be shown (0 = never) |
-| `AD_INAPP` | off | `on` = also show Monetag In-App Interstitial ads automatically to free users (2 per 6 min, 30 s apart). Or `freq,capping,interval,timeout` |
-| `AD_SDK_URL` | `https://libtl.com/sdk.js` | Change only if Monetag gives another address |
+| `AD_SDK_URL` | `https://sad.adsgram.ai/js/sad.min.js` | Change only if Adsgram gives another address |
 
 ## How it is protected
 

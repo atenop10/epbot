@@ -1,6 +1,6 @@
 """Watch an ad -> get time-limited access ("ad pass").
 
-Turned on by setting AD_REWARD_ZONE (your Monetag Rewarded Interstitial zone id) in .env. Then:
+Turned on by setting ADSGRAM_BLOCK_ID (your Adsgram *Reward* block id, digits only) in .env. Then:
   * everyone who is not an admin and has no paid subscription (/grant) must hold an active ad pass to listen
   * the Mini App shows a "Watch ad & unlock" screen; when the ad finishes the server saves a pass that ends in
     AD_PASS_MINUTES minutes
@@ -20,9 +20,9 @@ import os
 import time
 from contextlib import closing
 
-ZONE = os.environ.get("AD_REWARD_ZONE", "").strip()
-ENABLED = ZONE.isdigit()                                      # no zone id = feature off
-SDK_URL = os.environ.get("AD_SDK_URL", "https://libtl.com/sdk.js").strip()
+ZONE = (os.environ.get("ADSGRAM_BLOCK_ID") or os.environ.get("AD_REWARD_ZONE") or "").strip()  # Adsgram block id
+ENABLED = ZONE.isdigit()                                      # no block id = feature off
+SDK_URL = os.environ.get("AD_SDK_URL", "https://sad.adsgram.ai/js/sad.min.js").strip()
 if SDK_URL.startswith("//"):
     SDK_URL = "https:" + SDK_URL
 
@@ -43,23 +43,7 @@ TOKEN_MAX_AGE = 15 * 60
 SECRET = os.environ.get("STREAM_SECRET", "").strip().encode()
 
 
-def _inapp():
-    """Optional automatic In-App Interstitial for free users. AD_INAPP=off (default) | on | frequency,capping,interval,timeout"""
-    raw = os.environ.get("AD_INAPP", "off").strip().lower()
-    if raw in ("", "0", "off", "false", "no"):
-        return None
-    freq, cap, gap, wait = 2, 0.1, 30, 5                        # Monetag's sample: 2 ads per 6 min, 30 s apart, first after 5 s
-    if raw not in ("1", "on", "true", "yes"):
-        try:
-            a = [float(x) for x in raw.split(",")]
-            if len(a) == 4:
-                freq, cap, gap, wait = int(a[0]), a[1], int(a[2]), int(a[3])
-        except ValueError:
-            pass
-    return {"frequency": freq, "capping": cap, "interval": gap, "timeout": wait, "everyPage": False}
-
-
-INAPP = _inapp()
+INAPP = None   # Adsgram has no automatic in-app ads; kept so older code that reads adpass.INAPP still works
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS adpass(

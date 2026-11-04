@@ -110,7 +110,7 @@ def sub_expiry(uid):
 
 
 async def check_access(uid):
-    # Gate is ON when paid-only mode is on, or when ad-unlock is on (AD_REWARD_ZONE set).
+    # Gate is ON when paid-only mode is on, or when ad-unlock is on (ADSGRAM_BLOCK_ID set).
     if not (REQUIRE_SUB or adpass.ENABLED) or uid in ADMIN_IDS or sub_expiry(uid) > time.time():
         return True, ""
     if adpass.ENABLED and adpass.remaining(db, uid) > 0:   # watched an ad: time-limited access
@@ -749,12 +749,12 @@ async def cmd_stats(update, context):
 @admin_cmd
 async def cmd_adstats(update, context):
     if not adpass.ENABLED:
-        await update.message.reply_text("Ad-unlock is OFF. Set AD_REWARD_ZONE in .env (see REWARDED_ADS.md) and restart.")
+        await update.message.reply_text("Ad-unlock is OFF. Set ADSGRAM_BLOCK_ID in .env (see ADSGRAM_SETUP.md) and restart.")
         return
     st = adpass.stats(db)
     await update.message.reply_text(
         "🎁 Ad-unlock\n"
-        f"Zone {adpass.ZONE}, {adpass.MINUTES} min per ad, max {adpass.MAX_PER_DAY} per user per day\n\n"
+        f"Adsgram block {adpass.ZONE}, {adpass.MINUTES} min per ad, max {adpass.MAX_PER_DAY} per user per day\n\n"
         f"Ads watched: {st['ads_1d']} in 24h, {st['ads_7d']} in 7 days, {st['ads_all']} total\n"
         f"Viewers: {st['users_1d']} in 24h, {st['users_7d']} in 7 days\n"
         f"Listening on a free pass right now: {st['active']}\n"

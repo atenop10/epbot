@@ -120,13 +120,13 @@ async function api(path,body){
 function mountAd(id){const box=$(id);if(!cfg.ad||box.firstChild)return;box.innerHTML='<small>Advertisement</small><iframe src="/adframe" loading="lazy" sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" style="height:'+(+cfg.adh||280)+'px"></iframe>'}
 
 /* ---------- rewarded ads: watch an ad, listen free for a while (only if the server turned it on) ---------- */
-let passEnd=0,passT=null,chipT=null,adBusy=false,sdkP=null,inappOn=false,started=false;
+let passEnd=0,passT=null,chipT=null,adBusy=false,sdkP=null,adCtl=null,started=false;
 const remainSec=()=>Math.max(0,Math.round((passEnd-Date.now())/1000));
 function fmtLeft(s){const m=Math.max(1,Math.ceil(s/60));return m>=60?Math.floor(m/60)+' h'+(m%60?' '+m%60+' min':''):m+' min'}
-function loadSdk(){const R=cfg.reward,fn='show_'+(R&&R.zone);if(!R||!R.zone)return Promise.resolve(false);
- if(typeof window[fn]==='function')return Promise.resolve(true);if(sdkP)return sdkP;
- sdkP=new Promise(res=>{const el=document.createElement('script');el.src=R.sdk;el.async=true;el.dataset.zone=R.zone;el.dataset.sdk=fn;
-  el.onload=()=>res(typeof window[fn]==='function');el.onerror=()=>res(false);document.head.appendChild(el)}).then(ok=>{if(!ok)sdkP=null;return ok});
+function loadSdk(){const R=cfg.reward;if(!R||!R.zone)return Promise.resolve(false);   /* Adsgram SDK: window.Adsgram */
+ if(window.Adsgram)return Promise.resolve(true);if(sdkP)return sdkP;
+ sdkP=new Promise(res=>{const el=document.createElement('script');el.src=R.sdk;el.async=true;
+  el.onload=()=>res(!!window.Adsgram);el.onerror=()=>res(false);document.head.appendChild(el)}).then(ok=>{if(!ok)sdkP=null;return ok});
  return sdkP}
 function chip(){const R=cfg.reward,box=$('pass');if(!R||!R.on||!R.free||remainSec()<=0){box.hidden=true;return}
  box.hidden=false;$('passT').textContent='⏱ '+fmtLeft(remainSec())+' of free listening left';$('passX').hidden=remainSec()>=R.mins*60}
@@ -139,8 +139,11 @@ async function watchAd(){
  const R=cfg.reward;if(!R||!R.on||adBusy)return;adBusy=true;
  const go=$('wallGo'),x=$('passX');go.disabled=x.disabled=true;go.textContent='Loading ad…';
  try{
-  const ok=await loadSdk(),s=await api('/api/ad/start',{});let failed=!ok;
-  if(ok){try{await window['show_'+R.zone]()}catch(e){failed=true}}
+  const ok=await loadSdk(),s=await api('/api/ad/start',{});let failed=!ok,skipped=false;
+  if(ok){try{adCtl=adCtl||window.Adsgram.init({blockId:String(R.zone)});
+    const r=await adCtl.show();if(r&&r.done===false)skipped=true}   /* resolved = watched to the end */
+   catch(e){if(e&&e.error===false)skipped=true;else failed=true}}   /* rejected: error:false = user closed the ad, error:true = no ad / SDK error */
+  if(skipped){toast('Please watch the whole ad to unlock.');return}
   go.textContent='Unlocking…';
   const j=await api('/api/ad/claim',{token:s.token,failed});
   if(!j.ok){toast(j.msg||'Could not unlock. Try again.');return}
@@ -150,9 +153,6 @@ async function watchAd(){
  catch(e){if(e.message!=='auth'&&e.message!=='gate')toast(e.message)}
  finally{adBusy=false;go.disabled=x.disabled=false;go.textContent='▶ Watch ad & unlock'}}
 $('wallGo').onclick=watchAd;$('passX').onclick=watchAd;
-function startInApp(){const R=cfg.reward;if(inappOn||!R||!R.inapp||remainSec()<=0)return;inappOn=true;  /* optional automatic ads for free users (AD_INAPP) */
- loadSdk().then(ok=>{if(ok)try{window['show_'+R.zone]({type:'inApp',inAppSettings:R.inapp})}catch(e){}})}
-
 /* ---------- views ---------- */
 let view='home',homeY=0,S=null;
 function show(v){if(view==='home')homeY=scrollY;view=v;$('home').hidden=v!=='home';$('series').hidden=v!=='series';
@@ -258,7 +258,7 @@ function startApp(){
  const last=LS.get('last',null);
  if(last){const c=$('cont');c.firstChild.textContent='Continue: '+last.title;c.lastChild.textContent='Episode '+last.seq;c.hidden=false;
   c.onclick=async()=>{await openSeries(last.sid,last.title);playEpisode(last.sid,last.seq,last.title)}}
- startInApp();loadList(true)}
+ loadList(true)}
 (async function(){
  if(!initData){fatal('Please open this app from Telegram (use the Open app button in the bot).');return}
  try{cfg=await api('/api/config')}catch(e){return}
