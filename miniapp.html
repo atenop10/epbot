@@ -50,7 +50,7 @@ input[type=range]{width:100%;accent-color:var(--btn);height:28px}.tm{display:fle
 .opts{display:flex;justify-content:center;gap:10px}.opts button{background:var(--sec);padding:8px 14px;border-radius:999px;font-size:13px}
 #toast{position:fixed;left:50%;bottom:calc(90px + var(--safe));transform:translateX(-50%);background:#000c;color:#fff;padding:10px 16px;border-radius:12px;font-size:14px;z-index:70;max-width:86%;text-align:center}
 #gate,#wall{position:fixed;inset:0;background:var(--bg);z-index:50;display:flex;align-items:center;justify-content:center;text-align:center;padding:28px}
-#gate .b,#wall .b{max-width:340px}#gate p,#wall p{white-space:pre-line}#gate .primary,#gate .ghost,#wall .primary{display:block;width:100%;margin-top:10px}
+#gate .b,#wall .b{max-width:340px}#gate p,#wall p{white-space:pre-line}#gate .primary,#gate .ghost,#wall .primary,#wall .ghost{display:block;width:100%;margin-top:10px}
 #wall{z-index:55}#wall h2{margin:6px 0 10px;font-size:20px}#wall .primary:disabled,.passbar button:disabled{opacity:.6}
 .passbar{display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--sec);border-radius:12px;padding:8px 12px;margin:0 0 8px;font-size:13px}
 .passbar button{padding:6px 12px;border-radius:999px;background:var(--btn);color:var(--btx);font-size:13px;font-weight:600}
@@ -58,7 +58,7 @@ input[type=range]{width:100%;accent-color:var(--btn);height:28px}.tm{display:fle
 <main>
  <section id="home">
   <h1>🎧 AUDIOS FM</h1>
-  <div class="passbar" id="pass" hidden><span id="passT"></span><button id="passX">+ time</button></div>
+  <div class="passbar" id="pass" hidden><span id="passT"></span><button id="passX">▶ Ad</button></div>
   <div class="search"><input id="q" type="search" placeholder="Search series…" autocomplete="off" enterkeyhint="search"></div>
   <div class="tabs"><button id="tNew" class="on">Latest</button><button id="tAz">A–Z</button></div>
   <button id="cont" class="card cont" hidden><b></b><span></span></button>
@@ -92,7 +92,7 @@ input[type=range]{width:100%;accent-color:var(--btn);height:28px}.tm{display:fle
 </div></div>
 
 <div id="gate" hidden><div class="b"><h1>🔒</h1><p id="gateMsg"></p><div id="gateLinks"></div><button class="ghost" id="gateRetry">Try again</button></div></div>
-<div id="wall" hidden><div class="b"><h1>🎁</h1><h2>Listen free</h2><p id="wallMsg"></p><button class="primary" id="wallGo">▶ Watch ad &amp; unlock</button><p class="hint" id="wallHint" style="margin-top:14px"></p></div></div>
+<div id="wall" hidden><div class="b"><h1>🎁</h1><h2 id="wallT">Listen free</h2><p id="wallMsg"></p><button class="primary" id="wallGo">▶ Watch ad</button><button class="ghost" id="wallClose" hidden>Not now</button><p class="hint" id="wallHint" style="margin-top:14px"></p></div></div>
 <div id="toast" hidden></div>
 <audio id="a" preload="auto"></audio>
 
@@ -112,7 +112,7 @@ async function api(path,body){
  const r=await fetch(path,{method:body?'POST':'GET',headers:{'X-Init-Data':initData,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
  let j=null;try{j=await r.json()}catch(e){}
  if(r.status===401){fatal(initData?'Your session expired. Close this window and open the app again from the bot.':'Please open this app from Telegram (use the Open app button in the bot).');throw new Error('auth')}
- if(r.status===403&&j&&j.error==='gate'){if(j.adwall){if(cfg.reward)cfg.reward.rem=0;armPass();showWall('Your free time is up.')}else showGate(j);throw new Error('gate')}
+ if(r.status===403&&j&&j.error==='gate'){if(j.adwall){if(j.reward)cfg.reward=j.reward;else if(cfg.reward)cfg.reward.rem=0;armPass();showWall(freeMode()?'Your free listening time is used up.':'Your free time is up.')}else showGate(j);throw new Error('gate')}
  if(!r.ok){const e=new Error((j&&j.msg)||'Something went wrong. Try again.');e.status=r.status;throw e}
  return j}
 
@@ -120,39 +120,80 @@ async function api(path,body){
 function mountAd(id){const box=$(id);if(!cfg.ad||box.firstChild)return;box.innerHTML='<small>Advertisement</small><iframe src="/adframe" loading="lazy" sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox" style="height:'+(+cfg.adh||280)+'px"></iframe>'}
 
 /* ---------- rewarded ads: watch an ad, listen free for a while (only if the server turned it on) ---------- */
-let passEnd=0,passT=null,chipT=null,adBusy=false,sdkP=null,adCtl=null,started=false;
+let passEnd=0,passT=null,chipT=null,adBusy=false,sdkP=null,inappOn=false,started=false;
 const remainSec=()=>Math.max(0,Math.round((passEnd-Date.now())/1000));
 function fmtLeft(s){const m=Math.max(1,Math.ceil(s/60));return m>=60?Math.floor(m/60)+' h'+(m%60?' '+m%60+' min':''):m+' min'}
-function loadSdk(){const R=cfg.reward;if(!R||!R.zone)return Promise.resolve(false);   /* Adsgram SDK: window.Adsgram */
- if(window.Adsgram)return Promise.resolve(true);if(sdkP)return sdkP;
+const adReady=()=>{const R=cfg.reward;return !!R&&(R.provider==='adsgram'?!!(window.Adsgram&&window.Adsgram.init):typeof window['show_'+R.zone]==='function')};
+function loadSdk(){const R=cfg.reward;if(!R||!R.on||!R.sdk)return Promise.resolve(false);   /* loads the SDK of the network that shows the unlock ad */
+ if(adReady())return Promise.resolve(true);if(sdkP)return sdkP;
  sdkP=new Promise(res=>{const el=document.createElement('script');el.src=R.sdk;el.async=true;
-  el.onload=()=>res(!!window.Adsgram);el.onerror=()=>res(false);document.head.appendChild(el)}).then(ok=>{if(!ok)sdkP=null;return ok});
+  if(R.provider==='monetag'){el.dataset.zone=R.zone;el.dataset.sdk='show_'+R.zone}
+  el.onload=()=>res(adReady());el.onerror=()=>res(false);document.head.appendChild(el)}).then(ok=>{if(!ok)sdkP=null;return ok});
  return sdkP}
-function chip(){const R=cfg.reward,box=$('pass');if(!R||!R.on||!R.free||remainSec()<=0){box.hidden=true;return}
- box.hidden=false;$('passT').textContent='⏱ '+fmtLeft(remainSec())+' of free listening left';$('passX').hidden=remainSec()>=R.mins*60}
-function armPass(){clearTimeout(passT);clearInterval(chipT);const R=cfg.reward;if(!R||!R.on||!R.free)return;
- passEnd=Date.now()+(R.rem||0)*1000;chip();chipT=setInterval(chip,20000);
- if(remainSec()>0)passT=setTimeout(()=>{A.pause();chip();showWall('Your free time is up.')},remainSec()*1000+300)}
-function showWall(why){const R=cfg.reward||{};$('wallMsg').textContent=(why?why+'\n\n':'')+'Watch a short ad to listen free for '+(R.mins||60)+' minutes.';
- $('wallHint').textContent=R.contact?'No ads? '+R.contact:'';$('wallGo').disabled=false;$('wallGo').textContent='▶ Watch ad & unlock';$('wall').hidden=false}
+/* Adsgram: show() resolves only when the rewarded video was watched to the end; events tell us why it did not */
+let AG=null,agEv='';
+function agCtl(){if(AG)return AG;const R=cfg.reward;
+ AG=window.Adsgram.init(R.debug?{blockId:R.block,debug:true}:{blockId:R.block});
+ const on=(e,v)=>{try{AG.addEventListener(e,()=>{agEv=v})}catch(x){}};
+ on('onBannerNotFound','nofill');on('onError','error');on('onSkip','skip');on('onNonStopShow','nonstop');on('onTooLongSession','toolong');
+ return AG}
+async function showAd(){const R=cfg.reward;   /* -> {st:'done'|'failed'|'skipped'|'wait'|'stop', msg} */
+ if(R.provider==='adsgram'){
+  let c;try{c=agCtl()}catch(e){return{st:'failed'}}
+  agEv='';
+  try{await c.show();return{st:'done'}}
+  catch(r){const ev=agEv,err=!!(r&&r.error);
+   if(ev==='nonstop')return{st:'wait',msg:'Please wait a few seconds before the next ad.'};
+   if(ev==='toolong')return{st:'stop',msg:'Please close and reopen the app, then try again.'};
+   if(ev==='skip'&&!err)return{st:'skipped'};
+   if(ev==='nofill'||ev==='error'||err)return{st:'failed'};
+   return{st:'skipped'}}}
+ try{await window['show_'+R.zone]();return{st:'done'}}catch(e){return{st:'failed'}}}
+function fmtWait(s){s=Math.max(0,s);let h=Math.floor(s/3600),m=Math.ceil((s%3600)/60);if(m===60){h++;m=0}return h>0?h+' h'+(m?' '+m+' min':''):Math.max(1,m)+' min'}
+let nextAt=0;const freeMode=()=>{const R=cfg.reward;return !!R&&R.free_mins>0};   /* free mode = daily free minutes, the ad is only a bonus */
+function chip(){const R=cfg.reward,box=$('pass');if(!R||!R.on||!R.free){box.hidden=true;return}
+ const s=remainSec(),nf=Math.max(0,Math.round((nextAt-Date.now())/1000));
+ if(!freeMode()&&s<=0){box.hidden=true;return}
+ let t;
+ if(s>0)t='⏱ '+fmtLeft(s)+' of listening left';
+ else if(R.free_ready||(R.next_free>0&&nf<=0))t='🎁 '+R.free_mins+' free minutes today - they start when you press play';
+ else t='⏱ Free time used'+(nf>0?' - next free time in '+fmtWait(nf):'');
+ box.hidden=false;$('passT').textContent=t;$('passX').textContent='▶ Ad: +'+R.mins+' min';$('passX').hidden=s>=R.mins*60}
+function armPass(keepNext){clearTimeout(passT);clearInterval(chipT);const R=cfg.reward;if(!R||!R.on||!R.free){$('pass').hidden=true;return}
+ passEnd=Date.now()+(R.rem||0)*1000;if(!keepNext)nextAt=Date.now()+(R.next_free||0)*1000;chip();chipT=setInterval(chip,20000);
+ if(remainSec()>0){startInApp();passT=setTimeout(onPassEnd,remainSec()*1000+300)}}
+async function refreshReward(){try{const c=await api('/api/config');if(c&&c.reward)cfg.reward=c.reward}catch(e){}armPass()}
+async function onPassEnd(){A.pause();await refreshReward();if(remainSec()>0)return;showWall('Your listening time is over.')}
+function showWall(why){const R=cfg.reward||{},fm=freeMode(),nf=Math.max(0,Math.round((nextAt-Date.now())/1000)),L=[];
+ if(why)L.push(why);
+ L.push(fm?'Watch a short ad to get +'+(R.mins||60)+' minutes of listening as a bonus.':'Watch a short ad to listen free for '+(R.mins||60)+' minutes.');
+ if(fm&&(R.free_ready||nf>0))L.push(R.free_ready?'Your '+R.free_mins+' free minutes are still waiting - just press play.':'Or come back in '+fmtWait(nf)+' for '+R.free_mins+' free minutes.');
+ $('wallT').textContent=fm?'Need more time?':'Listen free';$('wallMsg').textContent=L.join('\n\n');
+ $('wallHint').textContent=R.contact?'No ads at all? '+R.contact:'';$('wallClose').hidden=!fm;
+ $('wallGo').disabled=false;$('wallGo').textContent='▶ Watch ad: +'+(R.mins||60)+' min';$('wall').hidden=false}
+$('wallClose').onclick=()=>{$('wall').hidden=true};
 async function watchAd(){
  const R=cfg.reward;if(!R||!R.on||adBusy)return;adBusy=true;
  const go=$('wallGo'),x=$('passX');go.disabled=x.disabled=true;go.textContent='Loading ad…';
  try{
-  const ok=await loadSdk(),s=await api('/api/ad/start',{});let failed=!ok,skipped=false;
-  if(ok){try{adCtl=adCtl||window.Adsgram.init({blockId:String(R.zone)});
-    const r=await adCtl.show();if(r&&r.done===false)skipped=true}   /* resolved = watched to the end */
-   catch(e){if(e&&e.error===false)skipped=true;else failed=true}}   /* rejected: error:false = user closed the ad, error:true = no ad / SDK error */
-  if(skipped){toast('Please watch the whole ad to unlock.');return}
-  go.textContent='Unlocking…';
-  const j=await api('/api/ad/claim',{token:s.token,failed});
-  if(!j.ok){toast(j.msg||'Could not unlock. Try again.');return}
-  R.rem=j.rem;armPass();$('wall').hidden=true;
-  toast(j.kind==='grace'?'No ad available right now - here are '+fmtLeft(j.rem)+' free.':'✅ Unlocked '+fmtLeft(j.rem)+' of listening');
+  const ok=await loadSdk(),s=await api('/api/ad/start',{});
+  const res=ok?await showAd():{st:'failed'};
+  if(res.st==='skipped'){toast('Please watch the whole ad to get the bonus.');return}
+  if(res.st==='wait'||res.st==='stop'){toast(res.msg);return}
+  go.textContent='Adding time…';
+  const j=await api('/api/ad/claim',{token:s.token,failed:res.st==='failed'});
+  if(!j.ok){toast(j.msg||'Could not add time. Try again.');return}
+  R.rem=j.rem;armPass(true);$('wall').hidden=true;
+  toast(j.kind==='grace'?'No ad available right now - here are '+fmtLeft(j.rem)+' free.':'✅ Bonus added - '+fmtLeft(j.rem)+' of listening');
   startApp()}
  catch(e){if(e.message!=='auth'&&e.message!=='gate')toast(e.message)}
- finally{adBusy=false;go.disabled=x.disabled=false;go.textContent='▶ Watch ad & unlock'}}
+ finally{adBusy=false;go.disabled=x.disabled=false;go.textContent='▶ Watch ad: +'+(R.mins||60)+' min'}}
 $('wallGo').onclick=watchAd;$('passX').onclick=watchAd;
+function startInApp(){const R=cfg.reward;if(inappOn||!R||!R.inapp||!R.zone||remainSec()<=0)return;inappOn=true;  /* optional automatic Monetag ads for free users (AD_INAPP) */
+ const fn='show_'+R.zone,go=()=>{try{window[fn]({type:'inApp',inAppSettings:R.inapp})}catch(e){}};
+ if(typeof window[fn]==='function')return go();
+ const el=document.createElement('script');el.src=R.msdk;el.async=true;el.dataset.zone=R.zone;el.dataset.sdk=fn;el.onload=go;document.head.appendChild(el)}
+
 /* ---------- views ---------- */
 let view='home',homeY=0,S=null;
 function show(v){if(view==='home')homeY=scrollY;view=v;$('home').hidden=v!=='home';$('series').hidden=v!=='series';
@@ -216,6 +257,7 @@ async function playEpisode(sid,seq,title){
  pend=seq;
  try{const j=await api('/api/play',{sid,seq});if(pend!==seq)return;
   cur={sid,seq,title:j.title||title,prev:j.prev,next:j.next};
+  if(j.reward&&j.reward.on){cfg.reward=j.reward;armPass()}
   A.src=j.url;A.playbackRate=rate;A.load();
   const p=LS.get('pos:'+sid+':'+seq,0);A.onloadedmetadata=()=>{$('dur').textContent=fmt(A.duration);if(p>5&&p<A.duration-5)A.currentTime=p};
   A.play().catch(()=>{});LS.set('last',{sid,seq,title:cur.title});ui();media();markNow()}
@@ -228,6 +270,13 @@ $('bPP').onclick=pp;$('fpp').onclick=pp;
 A.onplay=()=>{$('bPP').textContent=$('fpp').textContent='❚❚'};A.onpause=()=>{$('bPP').textContent=$('fpp').textContent='▶';savePos()};
 A.ontimeupdate=()=>{if(!A.duration)return;const f=A.currentTime/A.duration;$('pg').style.width=(f*100)+'%';if(!seeking){$('seek').value=f*1000;$('cur').textContent=fmt(A.currentTime)}};
 A.onerror=()=>{if(cur)toast('Could not play this episode. Close the app, open it again and retry.')};
+/* listening time (statistics only): count the seconds that were really playing and report them in batches */
+let lisAcc=0,lisLast=Date.now();
+function flushListen(){const secs=Math.round(lisAcc);if(secs<1)return;lisAcc=0;
+ try{fetch('/api/hb',{method:'POST',keepalive:true,headers:{'X-Init-Data':initData,'Content-Type':'application/json'},body:JSON.stringify({secs,sid:cur?cur.sid:0})}).catch(()=>{})}catch(e){}}
+setInterval(()=>{const now=Date.now(),d=(now-lisLast)/1000;lisLast=now;if(cur&&!A.paused&&!A.ended&&d<30)lisAcc+=d;if(lisAcc>=45)flushListen()},5000);
+A.addEventListener('pause',flushListen);A.addEventListener('ended',flushListen);
+document.addEventListener('visibilitychange',()=>{if(document.hidden)flushListen()});
 function savePos(){if(cur&&A.currentTime>5)LS.set('pos:'+cur.sid+':'+cur.seq,A.currentTime)}
 setInterval(()=>{if(!A.paused)savePos()},5000);
 A.onended=()=>{if(!cur)return;LS.del('pos:'+cur.sid+':'+cur.seq);const d=doneSet(cur.sid);d.add(cur.seq);LS.set('done:'+cur.sid,[...d]);
@@ -258,11 +307,11 @@ function startApp(){
  const last=LS.get('last',null);
  if(last){const c=$('cont');c.firstChild.textContent='Continue: '+last.title;c.lastChild.textContent='Episode '+last.seq;c.hidden=false;
   c.onclick=async()=>{await openSeries(last.sid,last.title);playEpisode(last.sid,last.seq,last.title)}}
- loadList(true)}
+ startInApp();loadList(true)}
 (async function(){
  if(!initData){fatal('Please open this app from Telegram (use the Open app button in the bot).');return}
- try{cfg=await api('/api/config')}catch(e){return}
+ try{cfg=await api('/api/config?open=1')}catch(e){return}   /* ?open=1 = count this as an app open */
  const R=cfg.reward;
- if(R&&R.on&&R.free){armPass();loadSdk();if(R.rem<=0){showWall('');return}}
+ if(R&&R.on&&R.free){armPass();loadSdk();if(!freeMode()&&R.rem<=0){showWall('');return}}   /* strict mode locks the app, free mode never does */
  startApp()})();
 </script></body></html>

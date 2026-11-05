@@ -36,7 +36,8 @@ bot profile) with `/mybots` -> your bot -> Bot Settings -> Configure Mini App.
 
 ## Ads in the Mini App
 
-- **Rewarded ads (watch an ad, listen free for a while):** see `REWARDED_ADS.md` (`bash setup-rewarded.sh <zone id>`).
+- **Usage statistics (`/stats`, `/user`):** see `STATS.md`.
+- **Rewarded ads (free daily listening, ad = bonus time):** see `REWARDED_ADS.md` (`bash setup-rewarded.sh adsgram <block id>`).
 
 - Anything you saved with `/sethead` (your Monetag zone script) is loaded on the Mini App page at top level - the
   same script that already works on the home page. That is the best place for OnClick / Vignette / Push formats.

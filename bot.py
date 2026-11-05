@@ -90,8 +90,15 @@ def init_db():
             user_id INTEGER PRIMARY KEY, username TEXT, name TEXT, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS plays(user_id INTEGER NOT NULL, story_id INTEGER NOT NULL, seq INTEGER NOT NULL, ts INTEGER NOT NULL);
         CREATE INDEX IF NOT EXISTS plays_ts ON plays(ts);
+        CREATE INDEX IF NOT EXISTS plays_user ON plays(user_id, ts);
+        CREATE TABLE IF NOT EXISTS appopens(user_id INTEGER NOT NULL, ts INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS appopens_ts ON appopens(ts);
+        CREATE TABLE IF NOT EXISTS listen(user_id INTEGER NOT NULL, day INTEGER NOT NULL, story_id INTEGER NOT NULL,
+            secs INTEGER NOT NULL, PRIMARY KEY(user_id, day, story_id));
+        CREATE INDEX IF NOT EXISTS listen_day ON listen(day);
         """)
         con.executescript(adpass.SCHEMA)
+        adpass.migrate(con)
         cols = {r[1] for r in con.execute("PRAGMA table_info(episodes)")}
         for col in ("tg_chat", "tg_msg"):  # Telegram-stored episodes: channel id + message id
             if col not in cols:
@@ -103,6 +110,14 @@ def fmt(ts):
     return datetime.fromtimestamp(ts).strftime("%d %b %Y")
 
 
+def fmt_wait(sec):
+    sec = max(int(sec), 0)
+    h, m = sec // 3600, -(-(sec % 3600) // 60)
+    if m == 60:
+        h, m = h + 1, 0
+    return (f"{h} h" + (f" {m} min" if m else "")) if h else f"{max(m, 1)} min"
+
+
 def sub_expiry(uid):
     with closing(db()) as con:
         r = con.execute("SELECT expires_at FROM subs WHERE user_id=?", (uid,)).fetchone()
@@ -110,16 +125,26 @@ def sub_expiry(uid):
 
 
 async def check_access(uid):
-    # Gate is ON when paid-only mode is on, or when ad-unlock is on (ADSGRAM_BLOCK_ID set).
+    # Gate is ON when paid-only mode is on, or when ad mode is on (AD_PROVIDER + id set).
     if not (REQUIRE_SUB or adpass.ENABLED) or uid in ADMIN_IDS or sub_expiry(uid) > time.time():
         return True, ""
-    if adpass.ENABLED and adpass.remaining(db, uid) > 0:   # watched an ad: time-limited access
-        return True, ""
+    if adpass.ENABLED:
+        # time left (free window or ad bonus), else start today's free window if it is available - no ad needed
+        if adpass.remaining(db, uid) > 0 or adpass.start_free(db, uid) > 0:
+            return True, ""
     exp = sub_expiry(uid)
     if adpass.ENABLED:
-        head = "⛔ Your subscription has expired.\n" if exp else ""
-        return False, (f"{head}🎧 Open the app and watch a short ad to listen free for {adpass.MINUTES} min.\n\n"
-                       f"Want it without ads? {CONTACT_TEXT}\n\nYour Telegram ID: {uid}")
+        nxt = adpass.info(db, uid)["next_free"] if adpass.FREE_MINUTES > 0 else 0
+        parts = []
+        if exp:
+            parts.append("⛔ Your subscription has expired.")
+        parts.append("⏱ Your free listening time is over." if adpass.FREE_MINUTES > 0 else "🎧 Listening needs a short ad.")
+        if nxt > 0:
+            parts.append(f"Free time comes back in {fmt_wait(nxt)}.")
+        parts.append(f"Want more now? Open the app and watch a short ad for +{adpass.MINUTES} min of listening as a bonus.")
+        parts.append(f"No ads at all? {CONTACT_TEXT}")
+        parts.append(f"Your Telegram ID: {uid}")
+        return False, "\n\n".join(parts)
     head = "⛔ Your subscription has expired." if exp else "🔒 This bot is only for paid members."
     return False, f"{head}\n{CONTACT_TEXT}\n\nYour Telegram ID: {uid}"
 
@@ -242,7 +267,8 @@ def help_text(is_admin):
             "/requests - pending user requests\n"
             "/reqdone <request id> - mark a request as added (notifies the user)\n"
             "/adstats - rewarded ads watched (ad-unlock mode)\n"
-            "/stats\n\nAdmins don't need a subscription."
+            "/user <telegram id or @username> - usage of one person\n"
+            "/stats - users, app opens, listening time, top series\n\nAdmins don't need a subscription."
         )
     return t
 
@@ -302,13 +328,20 @@ async def cmd_status(update, context):
     if exp > time.time():
         await update.message.reply_text(f"✅ Active until {fmt(exp)}.")
         return
-    left = adpass.remaining(db, uid) if adpass.ENABLED else 0
-    if left > 0:
-        await update.message.reply_text(f"⏱ Free listening: {max(left // 60, 1)} min left.\nOpen the app and tap + time to add more.",
-                                        reply_markup=app_button())
-    else:
-        ok, msg = await check_access(uid)
-        await update.message.reply_text(msg, reply_markup=app_button() if adpass.ENABLED else None)
+    if adpass.ENABLED:
+        st = adpass.info(db, uid)
+        if st["rem"] > 0:
+            await update.message.reply_text(f"⏱ Listening time left: {fmt_wait(st['rem'])}.\n"
+                                            f"Open the app and tap the ad button for +{adpass.MINUTES} min of bonus time.",
+                                            reply_markup=app_button())
+            return
+        if st["free_ready"]:
+            await update.message.reply_text(f"🎁 Your {adpass.FREE_MINUTES} free minutes start when you press play.\n"
+                                            f"Need more? Watch a short ad in the app for +{adpass.MINUTES} min.",
+                                            reply_markup=app_button())
+            return
+    ok, msg = await check_access(uid)
+    await update.message.reply_text(msg, reply_markup=app_button() if adpass.ENABLED else None)
 
 
 # ------------------------------------------------------------ admin commands
@@ -714,10 +747,23 @@ async def track_user(update, context):
         log.warning("user tracking failed: %s", e)
 
 
+def hm(secs):
+    """Seconds -> '5 h 20 min' / '45 min' / '0 min'."""
+    m = int(round(secs / 60))
+    if m == 0 and secs > 0:
+        return "<1 min"
+    return f"{m // 60} h {m % 60} min" if m >= 60 else f"{m} min"
+
+
+def who(uid, name, username):
+    return (name or "") + (f" (@{username})" if username else "") or str(uid)
+
+
 @admin_cmd
 async def cmd_stats(update, context):
     now = int(time.time())
     d1, d7, d30 = now - 86400, now - 7 * 86400, now - 30 * 86400
+    day0 = now // 86400                      # listening is stored per UTC day
     with closing(db()) as con:
         q = lambda sql, *a: con.execute(sql, a).fetchone()[0]
         total = q("SELECT COUNT(*) FROM users")
@@ -727,37 +773,117 @@ async def cmd_stats(update, context):
         s, n = q("SELECT COUNT(*) FROM stories"), q("SELECT COUNT(*) FROM stories WHERE title IS NOT NULL")
         e = q("SELECT COUNT(*) FROM episodes")
         p1, p7, pall = q("SELECT COUNT(*) FROM plays WHERE ts>?", d1), q("SELECT COUNT(*) FROM plays WHERE ts>?", d7), q("SELECT COUNT(*) FROM plays")
+        listeners1, listeners7 = (q("SELECT COUNT(DISTINCT user_id) FROM plays WHERE ts>?", d) for d in (d1, d7))
+        o1, o7 = q("SELECT COUNT(*) FROM appopens WHERE ts>?", d1), q("SELECT COUNT(*) FROM appopens WHERE ts>?", d7)
+        ou1, ou7 = (q("SELECT COUNT(DISTINCT user_id) FROM appopens WHERE ts>?", d) for d in (d1, d7))
+        t1, t7, tall = (q("SELECT COALESCE(SUM(secs),0) FROM listen WHERE day>=?", d) for d in (day0, day0 - 6, 0))
+        lu7 = q("SELECT COUNT(DISTINCT user_id) FROM listen WHERE day>=?", day0 - 6)
+        tracking_since = q("SELECT MIN(day) FROM listen")
         first = q("SELECT MIN(first_seen) FROM users")
         top = con.execute("SELECT COALESCE(s.title, 'Story ' || p.story_id) t, COUNT(*) c FROM plays p LEFT JOIN stories s "
                           "ON s.story_id=p.story_id WHERE p.ts>? GROUP BY p.story_id ORDER BY c DESC LIMIT 5", (d7,)).fetchall()
+        topmin = con.execute("SELECT COALESCE(s.title, 'Story ' || l.story_id) t, SUM(l.secs) c FROM listen l LEFT JOIN stories s "
+                             "ON s.story_id=l.story_id WHERE l.day>=? AND l.story_id>0 GROUP BY l.story_id ORDER BY c DESC LIMIT 5",
+                             (day0 - 6,)).fetchall()
+        toplis = con.execute("SELECT l.user_id, SUM(l.secs) c, u.name, u.username FROM listen l LEFT JOIN users u ON u.user_id=l.user_id "
+                             "WHERE l.day>=? GROUP BY l.user_id ORDER BY c DESC LIMIT 5", (day0 - 6,)).fetchall()
     lines = [
-        "📊 Bot stats",
+        "📊 Stats",
         "",
         f"👥 Users: {total} total" + (f" (counted since {fmt(first)})" if first else ""),
         f"   New: {new1} today, {new7} this week",
-        f"   Active: {act1} in 24h, {act7} in 7 days, {act30} in 30 days",
+        f"   Active (bot or app): {act1} in 24h, {act7} in 7 days, {act30} in 30 days",
         f"   Paid (active): {paid}",
         "",
-        f"🎧 Episodes sent: {p1} in 24h, {p7} in 7 days, {pall} total",
+        f"📱 App opens: {o1} in 24h, {o7} in 7 days",
+        f"   People who opened it: {ou1} in 24h, {ou7} in 7 days",
+        "",
+        f"🎧 Episodes played: {p1} in 24h, {p7} in 7 days, {pall} total",
+        f"   Listeners: {listeners1} in 24h, {listeners7} in 7 days",
+        f"⏱ Time listened: {hm(t1)} today (UTC), {hm(t7)} in 7 days, {hm(tall)} total"
+        + (f"\n   Average: {hm(t7 / lu7)} per listener in 7 days" if lu7 else "")
+        + (f"\n   (listening time counted since {datetime.fromtimestamp(tracking_since * 86400).strftime('%d %b %Y')})" if tracking_since else ""),
         f"📚 Library: {s} stories ({n} named), {e} episodes",
     ]
     if top:
-        lines += ["", "🔥 Top this week:"] + [f"   {r['t']} - {r['c']}" for r in top]
+        lines += ["", "🔥 Most played this week:"] + [f"   {r['t']} - {r['c']} plays" for r in top]
+    if topmin:
+        lines += ["", "⏱ Most listened this week:"] + [f"   {r['t']} - {hm(r['c'])}" for r in topmin]
+    if toplis:
+        lines += ["", "🏅 Top listeners this week:"] + [f"   {who(r['user_id'], r['name'], r['username'])} [{r['user_id']}] - {hm(r['c'])}" for r in toplis]
+    await update.message.reply_text("\n".join(lines))
+
+
+@admin_cmd
+async def cmd_user(update, context):
+    arg = " ".join(context.args).strip().lstrip("@")
+    if not arg:
+        await update.message.reply_text("Usage: /user <telegram id or @username>")
+        return
+    now = int(time.time())
+    d7, day0 = now - 7 * 86400, now // 86400
+    with closing(db()) as con:
+        q = lambda sql, *a: con.execute(sql, a).fetchone()[0]
+        if arg.isdigit():
+            u = con.execute("SELECT * FROM users WHERE user_id=?", (int(arg),)).fetchone()
+            uid = int(arg)
+        else:
+            u = con.execute("SELECT * FROM users WHERE lower(username)=lower(?)", (arg,)).fetchone()
+            uid = u["user_id"] if u else None
+        if uid is None:
+            await update.message.reply_text("No user with that username. Try the numeric Telegram id.")
+            return
+        plays7, plays_all = q("SELECT COUNT(*) FROM plays WHERE user_id=? AND ts>?", uid, d7), q("SELECT COUNT(*) FROM plays WHERE user_id=?", uid)
+        t7, tall = (q("SELECT COALESCE(SUM(secs),0) FROM listen WHERE user_id=? AND day>=?", uid, d) for d in (day0 - 6, 0))
+        o7, oall = q("SELECT COUNT(*) FROM appopens WHERE user_id=? AND ts>?", uid, d7), q("SELECT COUNT(*) FROM appopens WHERE user_id=?", uid)
+        ads_all = q("SELECT COUNT(*) FROM adlog WHERE user_id=? AND kind='ad'", uid)
+        ads7 = q("SELECT COUNT(*) FROM adlog WHERE user_id=? AND kind='ad' AND ts>?", uid, d7)
+        recent = con.execute("SELECT p.ts, p.seq, COALESCE(s.title, 'Story ' || p.story_id) t FROM plays p LEFT JOIN stories s "
+                             "ON s.story_id=p.story_id WHERE p.user_id=? ORDER BY p.ts DESC LIMIT 5", (uid,)).fetchall()
+    when = lambda ts: datetime.fromtimestamp(ts).strftime("%d %b %H:%M")
+    exp = sub_expiry(uid)
+    lines = [f"👤 {who(uid, u['name'] if u else None, u['username'] if u else None)} [{uid}]"]
+    if u:
+        lines.append(f"First seen {when(u['first_seen'])}, last active {when(u['last_seen'])}")
+    else:
+        lines.append("Not in the user list yet (never opened the bot or app).")
+    if uid in ADMIN_IDS:
+        lines.append("Access: admin")
+    elif exp > now:
+        lines.append(f"Access: paid until {fmt(exp)}")
+    elif adpass.ENABLED:
+        st = adpass.info(db, uid)
+        lines.append(f"Access: free user - {fmt_wait(st['rem'])} of time left" if st["rem"] > 0 else
+                     "Access: free user - no time left right now" + (f" (next free window in {fmt_wait(st['next_free'])})" if st["next_free"] > 0 else ""))
+    else:
+        lines.append("Access: " + ("no active subscription" if REQUIRE_SUB else "open"))
+    lines += ["",
+              f"📱 App opens: {o7} in 7 days, {oall} total",
+              f"🎧 Plays: {plays7} in 7 days, {plays_all} total",
+              f"⏱ Listened: {hm(t7)} in 7 days, {hm(tall)} total"]
+    if adpass.ENABLED:
+        lines.append(f"🎁 Ads watched: {ads7} in 7 days, {ads_all} total")
+    if recent:
+        lines += ["", "Recent plays:"] + [f"   {when(r['ts'])} - {r['t']} ep {r['seq']}" for r in recent]
     await update.message.reply_text("\n".join(lines))
 
 
 @admin_cmd
 async def cmd_adstats(update, context):
     if not adpass.ENABLED:
-        await update.message.reply_text("Ad-unlock is OFF. Set ADSGRAM_BLOCK_ID in .env (see ADSGRAM_SETUP.md) and restart.")
+        await update.message.reply_text("Rewarded ads are OFF. Run: bash setup-rewarded.sh adsgram <block id>  (see REWARDED_ADS.md)")
         return
     st = adpass.stats(db)
     await update.message.reply_text(
-        "🎁 Ad-unlock\n"
-        f"Adsgram block {adpass.ZONE}, {adpass.MINUTES} min per ad, max {adpass.MAX_PER_DAY} per user per day\n\n"
+        "🎁 Rewarded ads\n"
+        f"Provider: {adpass.PROVIDER} ({'block ' + adpass.BLOCK if adpass.PROVIDER == 'adsgram' else 'zone ' + adpass.ZONE})"
+        f"{' - TEST ADS ON' if adpass.PROVIDER == 'adsgram' and adpass.ADSGRAM_DEBUG else ''}\n"
+        f"Bonus: +{adpass.MINUTES} min per ad, max {adpass.MAX_PER_DAY} ads per user per day\n\n"
         f"Ads watched: {st['ads_1d']} in 24h, {st['ads_7d']} in 7 days, {st['ads_all']} total\n"
         f"Viewers: {st['users_1d']} in 24h, {st['users_7d']} in 7 days\n"
-        f"Listening on a free pass right now: {st['active']}\n"
+        f"Free daily windows started: {st['free_1d']} in 24h (free {adpass.FREE_MINUTES} min every {adpass.FREE_EVERY // 3600} h"
+        f"{'' if adpass.FREE_MINUTES else ' - OFF, strict ad gate'})\n"
+        f"Listening on a pass right now: {st['active']}\n"
         f"Ad could not load (short fallback pass): {st['grace_1d']} in 24h")
 
 
@@ -1194,26 +1320,47 @@ class _Ctx:
         self.bot = bot
 
 
+async def _force_join(uid):
+    miss = await missing_channels(BOT_APP.bot, uid)
+    if miss:
+        return {"ok": False, "msg": "🔒 Please join our channel first, then tap Try again.", "links": [l for _, l in miss if l]}
+    return None
+
+
 async def api_gate(uid):
+    """Used by endpoints that play audio. In ad mode this also starts the user's free daily window on first play."""
     ok, msg = await check_access(uid)
     if not ok and not adpass.ENABLED:
         return {"ok": False, "msg": msg, "links": []}
-    miss = await missing_channels(BOT_APP.bot, uid)   # with ad-unlock on, joining the channel comes first
-    if miss:
-        return {"ok": False, "msg": "🔒 Please join our channel first, then tap Try again.", "links": [l for _, l in miss if l]}
-    if not ok:  # ad-unlock mode: the app shows the "watch an ad" screen instead of an error
-        return {"ok": False, "adwall": True, "msg": msg, "links": []}
+    joined = await _force_join(uid)   # with ad mode on, joining the channel comes first
+    if joined:
+        return joined
+    if not ok:  # ad mode: the app shows the "watch an ad for bonus time" screen instead of an error
+        return {"ok": False, "adwall": True, "msg": msg, "links": [], "reward": await api_adstatus(uid)}
     return {"ok": True}
 
 
+async def api_browse(uid):
+    """Used by endpoints that do not play audio (open app, browse, search, request, ad buttons). Never starts the free window.
+    Free mode: anyone can browse, only the channel-join rule applies. Strict mode (AD_FREE_MINUTES=0): same as api_gate."""
+    if adpass.ENABLED and adpass.FREE_MINUTES > 0:
+        return await _force_join(uid) or {"ok": True}
+    return await api_gate(uid)
+
+
 async def api_adstatus(uid):
-    """What the Mini App needs to know about ad-unlock for this user."""
+    """What the Mini App needs to know about ad mode for this user."""
     if not adpass.ENABLED:
         return {"on": False}
-    free = uid not in ADMIN_IDS and sub_expiry(uid) <= time.time()   # paid users and admins never see ads gates
-    return {"on": True, "free": free, "zone": adpass.ZONE, "sdk": adpass.SDK_URL, "mins": adpass.MINUTES,
-            "rem": adpass.remaining(db, uid) if free else 0, "inapp": adpass.INAPP if free else None,
-            "contact": CONTACT_TEXT}
+    free = uid not in ADMIN_IDS and sub_expiry(uid) <= time.time()   # paid users and admins never see ads or time limits
+    adsgram = adpass.PROVIDER == "adsgram"
+    st = adpass.info(db, uid) if free else {"rem": 0, "free_ready": False, "next_free": 0}
+    return {"on": True, "free": free, "provider": adpass.PROVIDER,
+            "sdk": adpass.ADSGRAM_SDK if adsgram else adpass.SDK_URL,     # SDK of the network that shows the bonus ad
+            "block": adpass.BLOCK if adsgram else "", "debug": adpass.ADSGRAM_DEBUG if adsgram else False,
+            "zone": adpass.ZONE if adpass.ZONE.isdigit() else "", "msdk": adpass.SDK_URL,   # Monetag (also used for optional In-App ads)
+            "mins": adpass.MINUTES, "free_mins": adpass.FREE_MINUTES, "rem": st["rem"], "free_ready": st["free_ready"],
+            "next_free": st["next_free"], "inapp": adpass.INAPP if free else None, "contact": CONTACT_TEXT}
 
 
 async def api_send(uid, sid, seq):
@@ -1283,7 +1430,7 @@ def main():
         raise SystemExit("Set ADMIN_IDS in .env (your Telegram user id).")
     init_db()
     stream.configure(db, s3, R2_BUCKET, check_access)
-    stream.CTX.update(gate=api_gate, send=api_send, request=api_request, adstatus=api_adstatus)
+    stream.CTX.update(gate=api_gate, browse=api_browse, send=api_send, request=api_request, adstatus=api_adstatus)
     builder = Application.builder().token(BOT_TOKEN).concurrent_updates(True)
     if stream.ENABLED:
         builder = builder.post_init(on_start).post_shutdown(stream.stop)
@@ -1292,7 +1439,7 @@ def main():
     app.add_handler(TypeHandler(Update, track_user), group=-1)
     for name, fn in [("start", cmd_start), ("app", cmd_app), ("help", cmd_help), ("status", cmd_status), ("sync", cmd_sync),
                      ("stories", cmd_stories), ("name", cmd_name), ("swap", cmd_swap), ("grant", cmd_grant),
-                     ("revoke", cmd_revoke), ("subs", cmd_subs), ("clearcache", cmd_clearcache), ("stats", cmd_stats),
+                     ("revoke", cmd_revoke), ("subs", cmd_subs), ("clearcache", cmd_clearcache), ("stats", cmd_stats), ("user", cmd_user),
                      ("addto", cmd_addto), ("done", cmd_done), ("delete", cmd_delete), ("renumber", cmd_renumber),
                      ("forcesub", cmd_forcesub), ("setad", cmd_setad), ("adtest", cmd_adtest), ("adstats", cmd_adstats), ("sethead", cmd_sethead), ("list", cmd_list), ("request", cmd_request), ("requests", cmd_requests), ("reqdone", cmd_reqdone)]:
         app.add_handler(CommandHandler(name, fn, filters=priv))

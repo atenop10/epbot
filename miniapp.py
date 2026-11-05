@@ -8,6 +8,7 @@ STREAM_BASE_URL / STREAM_SECRET settings and the same HTTPS domain. Nothing new 
   GET  /api/list           series list / search            (?q=&sort=new|az&offset=)
   GET  /api/story/<id>     one series with its episode numbers
   POST /api/play           gives an audio URL for one episode
+  POST /api/hb             listening-time heartbeat (stats only, never blocks anyone)
   POST /api/send           sends a Telegram-stored episode to the user's chat
   POST /api/request        "please add this series" request
   GET  /m/<token>          the audio stream for the Mini App
@@ -112,10 +113,11 @@ def _like_clauses(q):
     return clauses, params
 
 
-async def _gate(uid, allow_adwall=False):
-    """Subscription + force-join rules of the bot. Returns None if allowed, else an error response.
-    With allow_adwall, a user who only lacks time (ad-unlock mode) is let through to the few endpoints that unlock it."""
-    cb = stream.CTX.get("gate")
+async def _gate(uid, allow_adwall=False, peek=False):
+    """Subscription / time / force-join rules of the bot. Returns None if allowed, else an error response.
+    peek=True is for endpoints that do not play audio: they never start the user's free daily window.
+    allow_adwall lets a user who only lacks time through (the ad buttons and /api/config)."""
+    cb = (stream.CTX.get("browse") if peek else None) or stream.CTX.get("gate")
     if cb:
         res = await cb(uid)
     else:
@@ -123,17 +125,19 @@ async def _gate(uid, allow_adwall=False):
         res = {"ok": ok, "msg": msg, "links": []}
     if res.get("ok") or (allow_adwall and res.get("adwall")):
         return None
-    return _json({"error": "gate", "adwall": bool(res.get("adwall")), "msg": res.get("msg", "Access denied."),
-                  "links": res.get("links", [])}, 403)
+    out = {"error": "gate", "adwall": bool(res.get("adwall")), "msg": res.get("msg", "Access denied."), "links": res.get("links", [])}
+    if res.get("reward"):
+        out["reward"] = res["reward"]          # lets the app show the exact time situation (next free window etc.)
+    return _json(out, 403)
 
 
-def _api(allow_adwall):
+def _api(allow_adwall, peek=False, gated=True):
     def deco(fn):
         async def wrapper(request):
             user = check_init_data(request.headers.get("X-Init-Data", ""))
             if not user:
                 return _json({"error": "auth"}, 401)
-            denied = await _gate(user["id"], allow_adwall)
+            denied = await _gate(user["id"], allow_adwall, peek) if gated else None
             if denied:
                 return denied
             try:
@@ -147,8 +151,10 @@ def _api(allow_adwall):
     return deco
 
 
-api = _api(False)      # normal endpoints: need access (paid, admin, or an active ad pass)
-api_ad = _api(True)    # config + ad endpoints: also open to a user who just needs to watch an ad
+api = _api(False)                  # play / send: need time (paid, admin, free window or ad bonus); starts the free window
+api_browse = _api(False, True)     # browse / search / request: open to everyone in free mode (strict mode = same as api)
+api_ad = _api(True, True)          # config + ad buttons: also open to a user who just needs more time
+api_stat = _api(True, True, gated=False)   # usage statistics: signed-in users only, no access rules (must never block or pop up a screen)
 
 
 async def _body(request):
@@ -179,8 +185,12 @@ def _page_html():
 
 
 def app_csp():
-    if stream.head_html() or adpass.ENABLED:  # ad network tag (/sethead) or rewarded-ad SDK: let its https scripts/frames load
-        return stream.player_csp(force=True)
+    if adpass.ENABLED:  # rewarded-ad SDK (Adsgram / Monetag): its scripts, frames and ad video load from https
+        return ("default-src 'self' https: data: blob:; style-src 'unsafe-inline' https:; "
+                "script-src 'unsafe-inline' 'unsafe-eval' https:; img-src https: data: blob:; "
+                "connect-src 'self' https: wss:; frame-src https:; media-src 'self' https: blob: data:")
+    if stream.head_html():  # an ad network tag was set with /sethead: let its https scripts/frames load
+        return stream.player_csp()
     return ("default-src 'self'; script-src 'unsafe-inline' https://telegram.org; style-src 'unsafe-inline'; "
             "img-src 'self' data:; connect-src 'self'; media-src 'self'; frame-src 'self'")
 
@@ -206,9 +216,49 @@ async def adframe(request):
                                    "default-src * data: blob: 'unsafe-inline' 'unsafe-eval'"})
 
 
+# ------------------------------------------------------------ usage statistics
+_open_seen = {}
+
+
+def _touch(user, opened=False):
+    """Counts Mini App use as activity: creates / refreshes the user row (so /stats Active and New include people who only use the app)
+    and, when the app was just opened, logs one open."""
+    now = int(time.time())
+    name = " ".join(x for x in (user.get("first_name"), user.get("last_name")) if x) or None
+    try:
+        with closing(stream.CTX["db"]()) as con:
+            con.execute("INSERT INTO users(user_id, username, name, first_seen, last_seen) VALUES(?,?,?,?,?) "
+                        "ON CONFLICT(user_id) DO UPDATE SET username=COALESCE(excluded.username, users.username), "
+                        "name=COALESCE(excluded.name, users.name), last_seen=excluded.last_seen",
+                        (user["id"], user.get("username"), name, now, now))
+            if opened:
+                con.execute("INSERT INTO appopens(user_id, ts) VALUES(?,?)", (user["id"], now))
+            con.commit()
+    except Exception as e:
+        log.warning("usage log failed: %s", e)
+
+
+def _add_listen(uid, sid, secs):
+    try:
+        with closing(stream.CTX["db"]()) as con:
+            con.execute("INSERT INTO listen(user_id, day, story_id, secs) VALUES(?,?,?,?) "
+                        "ON CONFLICT(user_id, day, story_id) DO UPDATE SET secs=secs+excluded.secs",
+                        (uid, int(time.time()) // 86400, sid, secs))
+            con.commit()
+    except Exception as e:
+        log.warning("listen log failed: %s", e)
+
+
 # ------------------------------------------------------------ API
 @api_ad
 async def config(request, user):
+    if request.query.get("open") == "1":     # the page was just opened (not a background refresh)
+        now = time.time()
+        if len(_open_seen) > 20000:
+            _open_seen.clear()
+        fresh = now - _open_seen.get(user["id"], 0) > 600      # reopening within 10 minutes counts as the same visit
+        _open_seen[user["id"]] = now
+        asyncio.get_running_loop().run_in_executor(None, _touch, user, fresh)
     cb = stream.CTX.get("adstatus")
     reward = await cb(user["id"]) if cb else {"on": False}
     return _json({"ad": bool(stream.ad_html()), "adh": stream.AD_HEIGHT, "uid": user["id"],
@@ -254,7 +304,7 @@ def _list_rows(q, sort, offset):
         return con.execute(sql, params).fetchall()
 
 
-@api
+@api_browse
 async def list_series(request, user):
     q = request.query.get("q", "").strip()[:60]
     sort = "az" if request.query.get("sort") == "az" else "new"
@@ -272,7 +322,7 @@ def _story(sid):
     return s, rows
 
 
-@api
+@api_browse
 async def story(request, user):
     sid = _int(request.match_info.get("sid"), -1, -1)
     s, rows = await asyncio.to_thread(_story, sid)
@@ -332,11 +382,26 @@ async def play(request, user):
     exp = int(time.time()) + stream.SESSION_SECONDS
     tok = stream.make_token(uid, sid, seq, exp)
     asyncio.get_running_loop().run_in_executor(None, _log_play, uid, sid, seq)
+    asyncio.get_running_loop().run_in_executor(None, _touch, user, False)
+    cb = stream.CTX.get("adstatus")   # the first play may have just started the free window: tell the app how much time it has
+    reward = await cb(uid) if cb else None
     resp = _json({"url": f"/m/{tok}", "title": (t["title"] if t and t["title"] else f"Story {sid}"), "seq": seq,
-                  "prev": (seq - 1) in near, "next": (seq + 1) in near})
+                  "prev": (seq - 1) in near, "next": (seq + 1) in near, "reward": reward})
     resp.set_cookie(COOKIE, _cookie_value(uid, exp), max_age=stream.SESSION_SECONDS, httponly=True,
                     secure=True, samesite="None", path="/")
     return resp
+
+
+@api_stat
+async def listen_hb(request, user):
+    """The page reports how many seconds of audio it actually played. Used for statistics only."""
+    if _limited(user["id"], "hb", 12, 60):
+        return _json({"ok": False}, 429)
+    data = await _body(request)
+    secs, sid = _int(data.get("secs"), 0, 0, 120), _int(data.get("sid"), 0, 0, 10**9)
+    if secs >= 1:
+        await asyncio.to_thread(_add_listen, user["id"], sid, secs)
+    return _json({"ok": True})
 
 
 @api
@@ -352,7 +417,7 @@ async def send(request, user):
     return _json({"ok": ok, "msg": msg})
 
 
-@api
+@api_browse
 async def request_series(request, user):
     data = await _body(request)
     text = str(data.get("text", "")).strip()[:200]
@@ -392,6 +457,7 @@ def add_routes(app):
     app.router.add_get("/api/list", list_series)
     app.router.add_get("/api/story/{sid}", story)
     app.router.add_post("/api/play", play)
+    app.router.add_post("/api/hb", listen_hb)
     app.router.add_post("/api/send", send)
     app.router.add_post("/api/request", request_series)
     app.router.add_get("/m/{tok}", audio)
