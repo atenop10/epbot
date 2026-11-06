@@ -354,12 +354,23 @@ async def serve_episode(request, ep):
 
 
 # ------------------------------------------------------------ lifecycle (run inside the bot's event loop)
+async def razorpay_hook(request):
+    """Razorpay payment webhook. The bot's handler checks the signature and adds the days."""
+    cb = CTX.get("pay_webhook")
+    if not cb:
+        return web.Response(status=404)
+    body = await request.read()
+    status, text = await cb(body, request.headers.get("X-Razorpay-Signature", ""))
+    return web.Response(status=status, text=text)
+
+
 async def start(_application=None):
     if not ENABLED:
         return
     # many listeners at once: give blocking R2 reads plenty of worker threads (the default is only a handful)
     asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=64))
     app = web.Application()
+    app.router.add_post("/razorpay/webhook", razorpay_hook)
     app.router.add_get("/", home)
     app.router.add_get("/p/{tok}", player)
     app.router.add_get("/a/{tok}", audio)

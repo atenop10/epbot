@@ -51,6 +51,9 @@ input[type=range]{width:100%;accent-color:var(--btn);height:28px}.tm{display:fle
 #toast{position:fixed;left:50%;bottom:calc(90px + var(--safe));transform:translateX(-50%);background:#000c;color:#fff;padding:10px 16px;border-radius:12px;font-size:14px;z-index:70;max-width:86%;text-align:center}
 #gate,#wall{position:fixed;inset:0;background:var(--bg);z-index:50;display:flex;align-items:center;justify-content:center;text-align:center;padding:28px}
 #gate .b,#wall .b{max-width:340px}#gate p,#wall p{white-space:pre-line}#gate .primary,#gate .ghost,#wall .primary,#wall .ghost{display:block;width:100%;margin-top:10px}
+#payc{position:fixed;inset:0;background:var(--bg);z-index:58;display:flex;align-items:center;justify-content:center;text-align:center;padding:28px}#payc .b{max-width:340px}#payc p{white-space:pre-line}#payc .primary,#payc .ghost{display:block;width:100%;margin-top:10px}#payc h2{margin:6px 0 10px;font-size:20px}#payc .primary:disabled{opacity:.6}
+.passbar .bt{display:flex;gap:6px;flex:none}.passbar .pay{background:none;border:1px solid var(--btn);color:var(--link)}
+.follow{margin:10px 0 0;padding:8px 14px;border-radius:999px;background:var(--sec);font-size:14px;color:var(--link);font-weight:600}.follow.on{background:var(--btn);color:var(--btx)}
 #wall{z-index:55}#wall h2{margin:6px 0 10px;font-size:20px}#wall .primary:disabled,.passbar button:disabled{opacity:.6}
 .passbar{display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--sec);border-radius:12px;padding:8px 12px;margin:0 0 8px;font-size:13px}
 .passbar button{padding:6px 12px;border-radius:999px;background:var(--btn);color:var(--btx);font-size:13px;font-weight:600}
@@ -58,9 +61,9 @@ input[type=range]{width:100%;accent-color:var(--btn);height:28px}.tm{display:fle
 <main>
  <section id="home">
   <h1>🎧 AUDIOS FM</h1>
-  <div class="passbar" id="pass" hidden><span id="passT"></span><button id="passX">▶ Ad</button></div>
+  <div class="passbar" id="pass" hidden><span id="passT"></span><span class="bt"><button id="passX">▶ Ad</button><button id="payX" class="pay" hidden>⭐ Ad-free</button></span></div>
   <div class="search"><input id="q" type="search" placeholder="Search series…" autocomplete="off" enterkeyhint="search"></div>
-  <div class="tabs"><button id="tNew" class="on">Latest</button><button id="tAz">A–Z</button></div>
+  <div class="tabs"><button id="tNew" class="on">Latest</button><button id="tAz">A–Z</button><button id="tFav">⭐ Favorites</button></div>
   <button id="cont" class="card cont" hidden><b></b><span></span></button>
   <div id="list"></div>
   <div id="empty" class="empty" hidden><p id="emptyMsg"></p><button id="reqBtn" class="primary" hidden>Request this series</button></div>
@@ -69,6 +72,7 @@ input[type=range]{width:100%;accent-color:var(--btn);height:28px}.tm{display:fle
  <section id="series" hidden>
   <div class="top"><button class="back" id="back">←</button><h1 id="sTitle"></h1></div>
   <div class="hint" id="sMeta" style="margin:6px 0 0 46px"></div>
+  <button class="follow" id="fav">☆ Add to favorites</button>
   <div id="sCont" style="margin-top:12px" hidden><button class="card cont" id="sContBtn"><b></b><span></span></button></div>
   <div class="jump"><input id="jump" type="number" inputmode="numeric" min="1" placeholder="Go to episode number"><button class="primary" id="go">Play</button></div>
   <div class="ad" id="adS"></div>
@@ -92,7 +96,8 @@ input[type=range]{width:100%;accent-color:var(--btn);height:28px}.tm{display:fle
 </div></div>
 
 <div id="gate" hidden><div class="b"><h1>🔒</h1><p id="gateMsg"></p><div id="gateLinks"></div><button class="ghost" id="gateRetry">Try again</button></div></div>
-<div id="wall" hidden><div class="b"><h1>🎁</h1><h2 id="wallT">Listen free</h2><p id="wallMsg"></p><button class="primary" id="wallGo">▶ Watch ad</button><button class="ghost" id="wallClose" hidden>Not now</button><p class="hint" id="wallHint" style="margin-top:14px"></p></div></div>
+<div id="wall" hidden><div class="b"><h1>🎁</h1><h2 id="wallT">Listen free</h2><p id="wallMsg"></p><button class="primary" id="wallGo">▶ Watch ad</button><button class="ghost" id="wallPay" hidden>⭐ Go ad-free</button><button class="ghost" id="wallClose" hidden>Not now</button><p class="hint" id="wallHint" style="margin-top:14px"></p></div></div>
+<div id="payc" hidden><div class="b"><h1>⭐</h1><h2 id="payT">Ad-free pass</h2><p id="payMsg"></p><div id="payPlans"></div><button class="primary" id="payChk" hidden>✅ I’ve paid - check</button><button class="ghost" id="payAgain" hidden>Open payment page again</button><button class="ghost" id="payClose">Close</button></div></div>
 <div id="toast" hidden></div>
 <audio id="a" preload="auto"></audio>
 
@@ -158,7 +163,8 @@ function chip(){const R=cfg.reward,box=$('pass');if(!R||!R.on||!R.free){box.hidd
  if(s>0)t='⏱ '+fmtLeft(s)+' of listening left';
  else if(R.free_ready||(R.next_free>0&&nf<=0))t='🎁 '+R.free_mins+' free minutes today - they start when you press play';
  else t='⏱ Free time used'+(nf>0?' - next free time in '+fmtWait(nf):'');
- box.hidden=false;$('passT').textContent=t;$('passX').textContent='▶ Ad: +'+R.mins+' min';$('passX').hidden=s>=R.mins*60}
+ box.hidden=false;$('passT').textContent=t;$('passX').textContent='▶ Ad: +'+R.mins+' min';$('passX').hidden=s>=R.mins*60;
+ $('payX').hidden=!R.pay;if(R.pay)$('payX').textContent='⭐ Ad-free from ₹'+minPrice(R)}
 function armPass(keepNext){clearTimeout(passT);clearInterval(chipT);const R=cfg.reward;if(!R||!R.on||!R.free){$('pass').hidden=true;return}
  passEnd=Date.now()+(R.rem||0)*1000;if(!keepNext)nextAt=Date.now()+(R.next_free||0)*1000;chip();chipT=setInterval(chip,20000);
  if(remainSec()>0){startInApp();passT=setTimeout(onPassEnd,remainSec()*1000+300)}}
@@ -169,7 +175,7 @@ function showWall(why){const R=cfg.reward||{},fm=freeMode(),nf=Math.max(0,Math.r
  L.push(fm?'Watch a short ad to get +'+(R.mins||60)+' minutes of listening as a bonus.':'Watch a short ad to listen free for '+(R.mins||60)+' minutes.');
  if(fm&&(R.free_ready||nf>0))L.push(R.free_ready?'Your '+R.free_mins+' free minutes are still waiting - just press play.':'Or come back in '+fmtWait(nf)+' for '+R.free_mins+' free minutes.');
  $('wallT').textContent=fm?'Need more time?':'Listen free';$('wallMsg').textContent=L.join('\n\n');
- $('wallHint').textContent=R.contact?'No ads at all? '+R.contact:'';$('wallClose').hidden=!fm;
+ $('wallHint').textContent=R.pay?'':(R.contact?'No ads at all? '+R.contact:'');$('wallClose').hidden=!fm;$('wallPay').hidden=!R.pay;if(R.pay)$('wallPay').textContent='⭐ Go ad-free: '+plansText(R);
  $('wallGo').disabled=false;$('wallGo').textContent='▶ Watch ad: +'+(R.mins||60)+' min';$('wall').hidden=false}
 $('wallClose').onclick=()=>{$('wall').hidden=true};
 async function watchAd(){
@@ -189,6 +195,41 @@ async function watchAd(){
  catch(e){if(e.message!=='auth'&&e.message!=='gate')toast(e.message)}
  finally{adBusy=false;go.disabled=x.disabled=false;go.textContent='▶ Watch ad: +'+(R.mins||60)+' min'}}
 $('wallGo').onclick=watchAd;$('passX').onclick=watchAd;
+/* ---------- paid pass (Razorpay): opens the payment page, then checks until it is paid ---------- */
+let payId=null,payUrl=null,payTimer=null;
+function payStop(){clearInterval(payTimer);payTimer=null}
+async function payCheck(silent){if(!payId)return false;
+ try{const j=await api('/api/pay/check',{id:payId});
+  if(j.paid){payStop();payId=null;$('payc').hidden=true;$('wall').hidden=true;await refreshReward();
+   toast('✅ Payment received - no ads'+(j.until?' until '+new Date(j.until*1000).toLocaleDateString():''));return true}
+  if(j.state==='closed'){payStop();$('payMsg').textContent='This payment link has expired. Close this and tap the button again for a new one.';return false}
+  if(!silent)toast('Payment not received yet. If you just paid, wait a few seconds and tap again.')}
+ catch(e){if(!silent&&e.message!=='auth')toast(e.message)}
+ return false}
+const plansOf=R=>(R&&R.plans&&R.plans.length)?R.plans:[{id:'',price:R.price,days:R.days}];
+const minPrice=R=>Math.min(...plansOf(R).map(p=>p.price));
+const plansText=R=>plansOf(R).map(p=>'₹'+p.price+'/'+p.days+'d').join(' or ');
+const planName=p=>(p.days===7?'Weekly':p.days===30?'Monthly':p.days+' days')+' - ₹'+p.price+' / '+p.days+' days';
+function showPlans(){const R=cfg.reward;if(!R||!R.pay)return;payStop();payId=null;payUrl=null;
+ $('payT').textContent='Choose your plan';$('payMsg').textContent='No ads and no time limits.\nUPI, cards and net banking work.\nPasses do not renew by themselves.';
+ const box=$('payPlans');box.innerHTML='';
+ plansOf(R).forEach(p=>{const b=document.createElement('button');b.className='primary';b.textContent='⭐ '+planName(p);b.onclick=()=>startPay(p);box.appendChild(b)});
+ $('payChk').hidden=true;$('payAgain').hidden=true;$('payc').hidden=false}
+async function startPay(p){const R=cfg.reward;if(!R||!R.pay)return;
+ const btns=[...$('payPlans').querySelectorAll('button')];btns.forEach(b=>b.disabled=true);
+ try{const j=await api('/api/pay/create',{plan:p.id});payId=j.id;payUrl=j.url;
+  $('payT').textContent='Ad-free pass';
+  $('payMsg').textContent='Pay ₹'+(j.price||p.price)+' for '+(j.days||p.days)+' days with no ads and no time limits.\nUPI, cards and net banking work.\n\nThe payment page opens in your browser. Come back here afterwards - it unlocks automatically.';
+  $('payPlans').innerHTML='';$('payChk').hidden=false;$('payAgain').hidden=false;
+  $('payc').hidden=false;if(tg&&tg.openLink)tg.openLink(payUrl);else window.open(payUrl,'_blank');
+  payStop();payTimer=setInterval(()=>payCheck(true),5000)}
+ catch(e){btns.forEach(b=>b.disabled=false);if(e.message!=='auth'&&e.message!=='gate')toast(e.message)}}
+$('payX').onclick=showPlans;$('wallPay').onclick=showPlans;
+$('payChk').onclick=()=>payCheck(false);
+$('payAgain').onclick=()=>{if(!payUrl)return;if(tg&&tg.openLink)tg.openLink(payUrl);else window.open(payUrl,'_blank')};
+$('payClose').onclick=()=>{payStop();$('payc').hidden=true};
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&payId&&!$('payc').hidden)payCheck(true)});
+
 function startInApp(){const R=cfg.reward;if(inappOn||!R||!R.inapp||!R.zone||remainSec()<=0)return;inappOn=true;  /* optional automatic Monetag ads for free users (AD_INAPP) */
  const fn='show_'+R.zone,go=()=>{try{window[fn]({type:'inApp',inAppSettings:R.inapp})}catch(e){}};
  if(typeof window[fn]==='function')return go();
@@ -214,28 +255,36 @@ async function loadList(reset){
  try{const j=await api('/api/list?q='+encodeURIComponent(L.q)+'&sort='+L.sort+'&offset='+L.offset);
   if(t!==L.tok)return;j.items.forEach(addCard);L.offset+=j.items.length;L.more=j.more;
   const none=L.offset===0;$('empty').hidden=!none;
-  if(none){$('emptyMsg').textContent=L.q?'No series found for “'+L.q+'”.':'No series have been added yet.';$('reqBtn').hidden=!L.q}
+  if(none){$('emptyMsg').textContent=L.q?'No series found for “'+L.q+'”.':(L.sort==='fav'?'No favorites yet. Open a series and tap “Add to favorites” - you will get a message in the bot chat when a new episode is added.':'No series have been added yet.');$('reqBtn').hidden=!L.q||L.sort==='fav'}
  }catch(e){if(t===L.tok&&e.message!=='auth'&&e.message!=='gate')toast(e.message)}
  finally{if(t===L.tok){L.busy=false;$('sentinel').textContent='';setTimeout(()=>{if(L.more&&$('sentinel').getBoundingClientRect().top<innerHeight+300)loadList(false)},0)}}}
 new IntersectionObserver(es=>{if(es[0].isIntersecting&&L.more&&!L.busy)loadList(false)},{rootMargin:'400px'}).observe($('sentinel'));
 let qT;$('q').oninput=e=>{clearTimeout(qT);qT=setTimeout(()=>{L.q=e.target.value.trim();loadList(true)},300)};
-function tab(s){L.sort=s;$('tNew').classList.toggle('on',s==='new');$('tAz').classList.toggle('on',s==='az');loadList(true)}
-$('tNew').onclick=()=>tab('new');$('tAz').onclick=()=>tab('az');
+function tab(s){L.sort=s;$('tNew').classList.toggle('on',s==='new');$('tAz').classList.toggle('on',s==='az');$('tFav').classList.toggle('on',s==='fav');loadList(true)}
+$('tNew').onclick=()=>tab('new');$('tAz').onclick=()=>tab('az');$('tFav').onclick=()=>tab('fav');
 $('reqBtn').onclick=async()=>{try{const j=await api('/api/request',{text:L.q});toast(j.msg);if(j.ok)$('reqBtn').hidden=true}catch(e){toast(e.message)}};
 
 /* ---------- series page ---------- */
 const doneSet=sid=>new Set(LS.get('done:'+sid,[]));
 async function openSeries(sid,title){
  S=null;$('sTitle').textContent=title||'';$('sMeta').textContent='';$('grid').textContent='';$('jump').value='';$('sCont').hidden=true;show('series');mountAd('adS');
- try{const j=await api('/api/story/'+sid);S={id:sid,title:j.title,eps:j.eps};renderSeries()}
+ try{const j=await api('/api/story/'+sid);S={id:sid,title:j.title,eps:j.eps,fav:!!j.fav};renderSeries()}
  catch(e){if(e.message!=='auth'&&e.message!=='gate')toast(e.message);show('home')}}
 function renderSeries(){
- $('sTitle').textContent=S.title;$('sMeta').textContent=S.eps.length+' episode'+(S.eps.length==1?'':'s');
+ $('sTitle').textContent=S.title;$('sMeta').textContent=S.eps.length+' episode'+(S.eps.length==1?'':'s');favUI();
  const done=doneSet(S.id),g=$('grid');g.textContent='';let anyTg=false;
  S.eps.forEach(([seq,p])=>{const b=H('button','ep'+(done.has(seq)?' done':'')+(p?'':' tg'),String(seq));b.dataset.seq=seq;if(!p)anyTg=true;g.appendChild(b)});
  $('legend').hidden=!anyTg;markNow();
  const last=LS.get('last',null);
  if(last&&last.sid===S.id&&S.eps.some(e=>e[0]===last.seq)){const c=$('sContBtn');c.firstChild.textContent='Continue · Episode '+last.seq;c.lastChild.textContent='Pick up where you stopped';$('sCont').hidden=false}}
+function favUI(){const b=$('fav');if(!S)return;b.classList.toggle('on',!!S.fav);b.textContent=S.fav?'★ In favorites · alerts on':'☆ Add to favorites'}
+$('fav').onclick=async()=>{if(!S)return;const sid=S.id,on=!S.fav;$('fav').disabled=true;
+ try{const j=await api('/api/fav',{sid,on});if(S&&S.id===sid){S.fav=!!j.fav;favUI()}
+  if(j.fav){toast('⭐ Added. You will get a message in the bot chat when a new episode is added.');
+   try{if(tg&&tg.requestWriteAccess)tg.requestWriteAccess(()=>{})}catch(e){}}   /* lets the bot message users who opened the app by a link */
+  else{toast('Removed from favorites.');if(L.sort==='fav')loadList(true)}}
+ catch(e){if(e.message!=='auth'&&e.message!=='gate')toast(e.message)}
+ finally{$('fav').disabled=false}};
 $('sContBtn').onclick=()=>{const l=LS.get('last',null);if(l)tapEp(l.seq)};
 $('grid').onclick=e=>{const b=e.target.closest('.ep');if(b)tapEp(+b.dataset.seq)};
 function markNow(){document.querySelectorAll('#grid .ep.now').forEach(x=>x.classList.remove('now'));
@@ -307,7 +356,8 @@ function startApp(){
  const last=LS.get('last',null);
  if(last){const c=$('cont');c.firstChild.textContent='Continue: '+last.title;c.lastChild.textContent='Episode '+last.seq;c.hidden=false;
   c.onclick=async()=>{await openSeries(last.sid,last.title);playEpisode(last.sid,last.seq,last.title)}}
- startInApp();loadList(true)}
+ startInApp();loadList(true);
+ const ds=new URLSearchParams(location.search).get('s');if(ds&&/^\d{1,9}$/.test(ds))openSeries(+ds,'')}   /* opened from a new-episode alert */
 (async function(){
  if(!initData){fatal('Please open this app from Telegram (use the Open app button in the bot).');return}
  try{cfg=await api('/api/config?open=1')}catch(e){return}   /* ?open=1 = count this as an app open */

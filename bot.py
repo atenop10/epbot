@@ -5,6 +5,7 @@
 - Sent audio is protected (no forward/save) and auto-deleted.
 """
 import asyncio
+import html
 import io
 import logging
 import os
@@ -18,7 +19,9 @@ import boto3
 from botocore.config import Config
 
 import adpass
+import pay
 import stream
+from telegram.error import Forbidden, RetryAfter
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, MenuButtonWebApp, Update, WebAppInfo
 from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, TypeHandler, filters,
@@ -97,6 +100,13 @@ def init_db():
             secs INTEGER NOT NULL, PRIMARY KEY(user_id, day, story_id));
         CREATE INDEX IF NOT EXISTS listen_day ON listen(day);
         """)
+        con.executescript("""
+        CREATE TABLE IF NOT EXISTS favs(user_id INTEGER NOT NULL, story_id INTEGER NOT NULL, created INTEGER NOT NULL,
+            PRIMARY KEY(user_id, story_id));
+        CREATE INDEX IF NOT EXISTS favs_story ON favs(story_id);
+        """)
+        con.executescript(pay.SCHEMA)
+        pay.migrate(con)
         con.executescript(adpass.SCHEMA)
         adpass.migrate(con)
         cols = {r[1] for r in con.execute("PRAGMA table_info(episodes)")}
@@ -142,7 +152,7 @@ async def check_access(uid):
         if nxt > 0:
             parts.append(f"Free time comes back in {fmt_wait(nxt)}.")
         parts.append(f"Want more now? Open the app and watch a short ad for +{adpass.MINUTES} min of listening as a bonus.")
-        parts.append(f"No ads at all? {CONTACT_TEXT}")
+        parts.append(f"No ads at all? Send /subscribe - {_plans_short()}." if pay.ENABLED else f"No ads at all? {CONTACT_TEXT}")
         parts.append(f"Your Telegram ID: {uid}")
         return False, "\n\n".join(parts)
     head = "⛔ Your subscription has expired." if exp else "🔒 This bot is only for paid members."
@@ -209,6 +219,7 @@ async def do_sync():
     found = await asyncio.to_thread(r2_scan)
     live = {k for k, *_ in found}
     added = removed = 0
+    new_eps = {}
     with closing(db()) as con:
         for (key,) in con.execute("SELECT key FROM episodes").fetchall():
             if key not in live and not key.startswith("tg/"):  # tg/ = stored in Telegram, not R2
@@ -226,9 +237,12 @@ async def do_sync():
                 nxt += 1
                 con.execute("INSERT INTO episodes(key, story_id, seq, size, modified) VALUES(?,?,?,?,?)",
                             (key, sid, nxt, size, mod))
+                new_eps.setdefault(sid, []).append(nxt)
                 added += 1
         con.commit()
         stories = con.execute("SELECT COUNT(*) FROM stories").fetchone()[0]
+    for sid, seqs in new_eps.items():
+        queue_notify(sid, seqs)
     return added, removed, stories
 
 
@@ -243,7 +257,9 @@ def help_text(is_admin):
         "/list - browse all available series\n"
         "/request <name> - ask for a series that isn't here\n\n"
         f"Episodes are protected and auto-delete after {max(DELETE_AFTER // 60, 1)} min - listen or save quickly.\n\n"
-        "/start - welcome\n/help - this message\n/status - your subscription / free time left"
+        "/favs - your favourite series (alerts for new episodes)\n"
+        + (f"/subscribe - go ad-free: {_plans_short()}\n" if pay.ENABLED else "")
+        + "/start - welcome\n/help - this message\n/status - your subscription / free time left"
     )
     if is_admin:
         t += (
@@ -951,6 +967,7 @@ async def add_via_telegram(update, context, media, sid):
         log.exception("add via telegram failed")
         await status.edit_text(f"❌ Failed: {e}\nCheck STORAGE_CHANNEL_ID and that the bot is an admin of the channel with permission to post.")
         return
+    queue_notify(sid, [seq])
     note = f"✅ Added to story {sid} ({title or 'unnamed'}) as Ep {seq} - saved in Telegram storage"
     if not title:
         note += f"\n⚠️ Story has no name yet - /name {sid} <title> so users can search it."
@@ -1041,6 +1058,7 @@ async def add_via_r2(update, context, media, sid, ext):
         log.exception("add episode failed")
         await status.edit_text(f"❌ Failed: {e}")
         return
+    queue_notify(sid, [seq])
     note = f"✅ Added to story {sid} ({title or 'unnamed'}) as Ep {seq}"
     if not title:
         note += f"\n⚠️ Story has no name yet - /name {sid} <title> so users can search it."
@@ -1171,10 +1189,38 @@ async def on_text(update, context):
 async def on_callback(update, context):
     q = update.callback_query
     action, _, val = q.data.partition(":")
-    if action != "fsub":
+    if action not in ("fsub", "pay"):     # these two answer the query themselves (they may show an alert)
         await q.answer()
     if action == "del":
         await delete_callback(update, context)
+        return
+    if action == "unfav" and val.isdigit():
+        fav_set(q.from_user.id, int(val), False)
+        try:
+            await q.message.reply_text("🔕 Alerts for this series are off. You can turn them on again in the app (Add to favorites).")
+        except Exception:
+            pass
+        return
+    if action == "plan":
+        await pick_plan(q, val)
+        return
+    if action == "pay":
+        try:
+            state, done = await pay.check(db, q.from_user.id, val)
+        except Exception as e:
+            log.error("payment check failed: %s", e)
+            await q.answer("Could not check right now. Try again in a minute.", show_alert=True)
+            return
+        if state == "open":
+            await q.answer("Payment not received yet. If you just paid, wait a few seconds and tap again.", show_alert=True)
+            return
+        await q.answer()
+        if done:
+            await notify_paid(*done)
+        elif state == "paid":
+            await q.message.reply_text(f"✅ Your payment is already confirmed. Active until {fmt(sub_expiry(q.from_user.id))}.")
+        else:
+            await q.message.reply_text("That payment link has expired. Send /subscribe to get a new one.")
         return
     ok, msg = await check_access(q.from_user.id)
     if not ok:
@@ -1313,6 +1359,205 @@ async def send_episodes(update, context, story_id, lo, hi):
     await update.message.reply_text(note)
 
 
+# ------------------------------------------------------------ favourites + new-episode alerts
+NOTIFY_DELAY = int(os.environ.get("NOTIFY_DELAY_SECONDS", "90"))   # wait this long so a batch of uploads becomes ONE message
+NOTIFY_PENDING = {}     # story id -> episode numbers added since the last alert
+NOTIFY_TASKS = {}       # story id -> the waiting task
+
+
+def fav_set(uid, sid, on):
+    with closing(db()) as con:
+        if on:
+            con.execute("INSERT OR IGNORE INTO favs(user_id, story_id, created) VALUES(?,?,?)", (uid, sid, int(time.time())))
+        else:
+            con.execute("DELETE FROM favs WHERE user_id=? AND story_id=?", (uid, sid))
+        con.commit()
+
+
+def fav_has(uid, sid):
+    with closing(db()) as con:
+        return con.execute("SELECT 1 FROM favs WHERE user_id=? AND story_id=?", (uid, sid)).fetchone() is not None
+
+
+def queue_notify(sid, seqs):
+    """Called whenever episodes are added. Followers get one message per series after NOTIFY_DELAY seconds of quiet."""
+    if not seqs or BOT_APP is None:
+        return
+    NOTIFY_PENDING.setdefault(sid, []).extend(seqs)
+    if sid not in NOTIFY_TASKS:
+        NOTIFY_TASKS[sid] = asyncio.get_running_loop().create_task(_notify_later(sid))
+
+
+async def _notify_later(sid):
+    try:
+        last = -1
+        while len(NOTIFY_PENDING.get(sid, [])) != last:      # still being added? wait again
+            last = len(NOTIFY_PENDING.get(sid, []))
+            await asyncio.sleep(NOTIFY_DELAY)
+        seqs = sorted(set(NOTIFY_PENDING.pop(sid, [])))
+        NOTIFY_TASKS.pop(sid, None)
+        await send_new_episode_alert(sid, seqs)
+    except Exception:
+        log.exception("new-episode alert failed for story %s", sid)
+        NOTIFY_PENDING.pop(sid, None)
+        NOTIFY_TASKS.pop(sid, None)
+
+
+def _seq_text(seqs):
+    if len(seqs) == 1:
+        return f"Episode {seqs[0]} is out"
+    if seqs[-1] - seqs[0] + 1 == len(seqs):
+        return f"Episodes {seqs[0]}-{seqs[-1]} are out"
+    return "Episodes " + ", ".join(map(str, seqs[:8])) + (" ..." if len(seqs) > 8 else "") + " are out"
+
+
+async def send_new_episode_alert(sid, seqs):
+    with closing(db()) as con:
+        t = con.execute("SELECT title FROM stories WHERE story_id=?", (sid,)).fetchone()
+        fans = [r[0] for r in con.execute("SELECT user_id FROM favs WHERE story_id=?", (sid,))]
+    title = t["title"] if t and t["title"] else None
+    if not title or not fans or not seqs:      # an unnamed series has no followers; nothing to send
+        return
+    text = f"🆕 <b>{html.escape(title)}</b>\n{_seq_text(seqs)}!"
+    rows = []
+    if stream.ENABLED:
+        rows.append([InlineKeyboardButton("▶ Listen now", web_app=WebAppInfo(url=f"{stream.BASE_URL}/app?s={sid}"))])
+    rows.append([InlineKeyboardButton("🔕 Stop alerts for this series", callback_data=f"unfav:{sid}")])
+    kb = InlineKeyboardMarkup(rows)
+    sent = blocked = 0
+    for uid in fans:
+        try:
+            try:
+                await BOT_APP.bot.send_message(uid, text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after + 1)
+                await BOT_APP.bot.send_message(uid, text, parse_mode="HTML", reply_markup=kb, disable_web_page_preview=True)
+            sent += 1
+        except Forbidden:       # the user blocked the bot or deleted the chat: stop trying
+            blocked += 1
+            with closing(db()) as con:
+                con.execute("DELETE FROM favs WHERE user_id=?", (uid,))
+                con.commit()
+        except Exception as e:
+            log.warning("alert to %s failed: %s", uid, e)
+        await asyncio.sleep(0.06)    # stay under Telegram's ~30 messages per second
+    log.info("new-episode alert story %s: sent %s, blocked %s", sid, sent, blocked)
+
+
+async def cmd_favs(update, context):
+    uid = update.effective_user.id
+    with closing(db()) as con:
+        rows = con.execute("SELECT s.story_id id, s.title title FROM favs f JOIN stories s ON s.story_id=f.story_id "
+                           "WHERE f.user_id=? AND s.title IS NOT NULL ORDER BY s.title COLLATE NOCASE", (uid,)).fetchall()
+    if not rows:
+        await update.message.reply_text("⭐ You have no favourite series yet.\nOpen the app, open a series and tap "
+                                        "“Add to favorites” - you will get a message here when a new episode is added.",
+                                        reply_markup=app_button())
+        return
+    kb = [[InlineKeyboardButton(f"🔕 {r['title'][:48]}", callback_data=f"unfav:{r['id']}")] for r in rows[:50]]
+    await update.message.reply_text("⭐ Your favourite series (you get an alert for each new episode).\n"
+                                    "Tap one to stop its alerts:", reply_markup=InlineKeyboardMarkup(kb))
+
+
+# ------------------------------------------------------------ paid passes (Razorpay): weekly + monthly plans
+def _plans_short():
+    return " or ".join(f"Rs {pl['price']} for {pl['days']} days" for pl in pay.PLANS)
+
+
+def _plans_kb():
+    rows = [[InlineKeyboardButton(f"⭐ {pay.plan_label(pl)}", callback_data=f"plan:{pl['id']}")] for pl in pay.PLANS]
+    return InlineKeyboardMarkup(rows)
+
+
+def _pay_text(pl):
+    return (f"⭐ Ad-free pass - Rs {pl['price']} for {pl['days']} days\n\n"
+            "• No ads, no daily time limit\n• Pay with UPI, card or net banking\n"
+            f"• One payment = {pl['days']} days (it does not renew by itself)\n\n"
+            "After you pay, access starts within a few seconds. If it does not, tap “I've paid”.")
+
+
+def _pay_kb(url, link_id, pl):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(f"💳 Pay Rs {pl['price']}", url=url)],
+                                 [InlineKeyboardButton("✅ I've paid", callback_data=f"pay:{link_id}")]])
+
+
+def _plans_text(uid):
+    lines = ["⭐ Ad-free pass - choose a plan\n"] + [f"• {pay.plan_label(pl)}" for pl in pay.PLANS]
+    lines.append("\nNo ads and no daily time limit. Pay with UPI, card or net banking. Passes do not renew by themselves.")
+    exp = sub_expiry(uid)
+    if exp > time.time():
+        lines.append(f"\nYour pass is active until {fmt(exp)}. Paying now adds the days on top.")
+    return "\n".join(lines)
+
+
+async def cmd_subscribe(update, context):
+    uid = update.effective_user.id
+    if not pay.ENABLED:
+        await update.message.reply_text(CONTACT_TEXT)
+        return
+    await update.message.reply_text(_plans_text(uid), reply_markup=_plans_kb())
+
+
+async def pick_plan(q, plan_id):
+    """The user tapped one of the plan buttons: make (or reuse) the payment link for that plan."""
+    pl = pay.get_plan(plan_id)
+    if not pay.ENABLED or not pl:
+        await q.message.reply_text("That plan is not available. Send /subscribe to see the current plans.")
+        return
+    try:
+        link_id, url = await pay.create_link(db, q.from_user.id, pl["id"])
+    except Exception as e:
+        log.error("create payment link failed: %s", e)
+        await q.message.reply_text("Could not create the payment link right now. Please try again in a minute.")
+        return
+    exp = sub_expiry(q.from_user.id)
+    note = f"\n\nYour pass is active until {fmt(exp)}. Paying now adds {pl['days']} more days." if exp > time.time() else ""
+    await q.message.reply_text(_pay_text(pl) + note, reply_markup=_pay_kb(url, link_id, pl))
+
+
+async def notify_paid(uid, new_exp, rupees=None):
+    try:
+        await BOT_APP.bot.send_message(uid, f"✅ Payment received! No ads until {fmt(new_exp)}. Enjoy listening 🎧",
+                                       reply_markup=app_button())
+    except Exception as e:
+        log.warning("could not confirm payment to %s: %s", uid, e)
+    for aid in ADMIN_IDS:
+        try:
+            await BOT_APP.bot.send_message(aid, f"💰 Rs {rupees if rupees is not None else pay.PRICE} received from {uid} - active until {fmt(new_exp)}.")
+        except Exception:
+            pass
+
+
+async def api_pay_create(uid, plan_id=None):
+    pl = pay.get_plan(plan_id) if plan_id is not None else pay.PLANS[0]
+    if not pl:
+        return {"ok": False, "error": "plan", "msg": "That plan is not available."}
+    link_id, url = await pay.create_link(db, uid, pl["id"])
+    return {"ok": True, "id": link_id, "url": url, "price": pl["price"], "days": pl["days"]}
+
+
+async def api_pay_check(uid, link_id):
+    state, done = await pay.check(db, uid, link_id)
+    if done:
+        await notify_paid(*done)
+    exp = sub_expiry(uid)
+    return {"ok": True, "paid": state == "paid", "state": state, "until": exp if exp > time.time() else 0}
+
+
+async def pay_webhook(body, sig):
+    """Razorpay -> us. Returns (http status, text)."""
+    if not pay.verify(body, sig):
+        return 400, "bad signature"
+    try:
+        done = pay.handle_event(db, body)
+    except Exception:
+        log.exception("razorpay webhook failed")
+        return 500, "error"       # Razorpay retries on errors
+    if done:
+        await notify_paid(*done)
+    return 200, "ok"
+
+
 # ------------------------------------------------------------ Mini App support (called from miniapp.py via stream.CTX)
 class _Ctx:
     """Minimal stand-in for the handler context: send_one only needs .bot."""
@@ -1360,7 +1605,8 @@ async def api_adstatus(uid):
             "block": adpass.BLOCK if adsgram else "", "debug": adpass.ADSGRAM_DEBUG if adsgram else False,
             "zone": adpass.ZONE if adpass.ZONE.isdigit() else "", "msdk": adpass.SDK_URL,   # Monetag (also used for optional In-App ads)
             "mins": adpass.MINUTES, "free_mins": adpass.FREE_MINUTES, "rem": st["rem"], "free_ready": st["free_ready"],
-            "next_free": st["next_free"], "inapp": adpass.INAPP if free else None, "contact": CONTACT_TEXT}
+            "next_free": st["next_free"], "inapp": adpass.INAPP if free else None, "contact": CONTACT_TEXT,
+            "pay": pay.ENABLED, "price": pay.PRICE, "days": pay.DAYS, "plans": pay.plans_public()}
 
 
 async def api_send(uid, sid, seq):
@@ -1428,16 +1674,19 @@ async def on_start(application):
 def main():
     if not ADMIN_IDS:
         raise SystemExit("Set ADMIN_IDS in .env (your Telegram user id).")
+    global BOT_APP
     init_db()
     stream.configure(db, s3, R2_BUCKET, check_access)
-    stream.CTX.update(gate=api_gate, browse=api_browse, send=api_send, request=api_request, adstatus=api_adstatus)
+    stream.CTX.update(gate=api_gate, browse=api_browse, send=api_send, request=api_request, adstatus=api_adstatus,
+                      pay_create=api_pay_create, pay_check=api_pay_check, pay_webhook=pay_webhook, fav_set=fav_set, fav_has=fav_has)
     builder = Application.builder().token(BOT_TOKEN).concurrent_updates(True)
     if stream.ENABLED:
         builder = builder.post_init(on_start).post_shutdown(stream.stop)
     app = builder.build()
+    BOT_APP = app      # also needed when streaming is off: new-episode alerts and payment messages use it
     priv = filters.ChatType.PRIVATE
     app.add_handler(TypeHandler(Update, track_user), group=-1)
-    for name, fn in [("start", cmd_start), ("app", cmd_app), ("help", cmd_help), ("status", cmd_status), ("sync", cmd_sync),
+    for name, fn in [("start", cmd_start), ("app", cmd_app), ("help", cmd_help), ("status", cmd_status), ("subscribe", cmd_subscribe), ("buy", cmd_subscribe), ("favs", cmd_favs), ("sync", cmd_sync),
                      ("stories", cmd_stories), ("name", cmd_name), ("swap", cmd_swap), ("grant", cmd_grant),
                      ("revoke", cmd_revoke), ("subs", cmd_subs), ("clearcache", cmd_clearcache), ("stats", cmd_stats), ("user", cmd_user),
                      ("addto", cmd_addto), ("done", cmd_done), ("delete", cmd_delete), ("renumber", cmd_renumber),

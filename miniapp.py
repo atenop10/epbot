@@ -32,6 +32,7 @@ from urllib.parse import parse_qsl
 from aiohttp import web
 
 import adpass
+import pay
 import stream
 
 log = logging.getLogger("episodes-bot.miniapp")
@@ -287,10 +288,13 @@ async def ad_claim(request, user):
     return _json(res)
 
 
-def _list_sql(q, sort, limit, offset):
+def _list_sql(q, sort, limit, offset, uid=None):
     clauses, params = _like_clauses(q)
     where = "s.title IS NOT NULL AND s.title<>''" + "".join(" AND " + c for c in clauses)
-    order = "m DESC, s.title COLLATE NOCASE" if sort == "new" else "s.title COLLATE NOCASE"
+    if sort == "fav":      # only the series this user added to favorites
+        where += " AND s.story_id IN (SELECT story_id FROM favs WHERE user_id=?)"
+        params = params + [uid]
+    order = "m DESC, s.title COLLATE NOCASE" if sort in ("new", "fav") else "s.title COLLATE NOCASE"
     sql = ("SELECT s.story_id id, s.title title, COUNT(e.key) c, "
            "SUM(CASE WHEN e.key LIKE 'tg/%' THEN 0 ELSE 1 END) p, MAX(e.modified) m "
            "FROM stories s JOIN episodes e ON e.story_id=s.story_id "
@@ -298,8 +302,8 @@ def _list_sql(q, sort, limit, offset):
     return sql, params + [limit + 1, offset]
 
 
-def _list_rows(q, sort, offset):
-    sql, params = _list_sql(q, sort, PAGE_SIZE, offset)
+def _list_rows(q, sort, offset, uid=None):
+    sql, params = _list_sql(q, sort, PAGE_SIZE, offset, uid)
     with closing(stream.CTX["db"]()) as con:
         return con.execute(sql, params).fetchall()
 
@@ -307,9 +311,10 @@ def _list_rows(q, sort, offset):
 @api_browse
 async def list_series(request, user):
     q = request.query.get("q", "").strip()[:60]
-    sort = "az" if request.query.get("sort") == "az" else "new"
+    sort = request.query.get("sort")
+    sort = sort if sort in ("az", "fav") else "new"
     offset = _int(request.query.get("offset"), 0, 0, 100000)
-    rows = await asyncio.to_thread(_list_rows, q, sort, offset)
+    rows = await asyncio.to_thread(_list_rows, q, sort, offset, user["id"])
     more = len(rows) > PAGE_SIZE
     items = [{"id": r["id"], "title": r["title"], "c": r["c"], "p": r["p"] or 0} for r in rows[:PAGE_SIZE]]
     return _json({"items": items, "more": more})
@@ -329,7 +334,56 @@ async def story(request, user):
     if not rows:
         return _json({"error": "notfound"}, 404)
     title = s["title"] if s and s["title"] else f"Story {sid}"
-    return _json({"id": sid, "title": title, "eps": [[r["seq"], 0 if r["key"].startswith("tg/") else 1] for r in rows]})
+    fav = bool(stream.CTX.get("fav_has") and await asyncio.to_thread(stream.CTX["fav_has"], user["id"], sid))
+    return _json({"id": sid, "title": title, "fav": fav, "eps": [[r["seq"], 0 if r["key"].startswith("tg/") else 1] for r in rows]})
+
+
+@api_browse
+async def set_fav(request, user):
+    """Add / remove a series from the user's favorites (new-episode alerts go to the bot chat)."""
+    if _limited(user["id"], "fav", 30, 60):
+        return _json({"error": "slow", "msg": "Too many requests - wait a moment."}, 429)
+    data = await _body(request)
+    sid, on = _int(data.get("sid"), -1, -1), bool(data.get("on"))
+    s, rows = await asyncio.to_thread(_story, sid)
+    if not rows or not (s and s["title"]):
+        return _json({"error": "notfound", "msg": "Series not found."}, 404)
+    await asyncio.to_thread(stream.CTX["fav_set"], user["id"], sid, on)
+    return _json({"ok": True, "fav": on})
+
+
+@api_ad
+async def pay_create(request, user):
+    cb = stream.CTX.get("pay_create")
+    if not cb or not stream.CTX.get("pay_check") or not pay.ENABLED:
+        return _json({"error": "off", "msg": "Payments are not set up yet."}, 400)
+    if _limited(user["id"], "pay", 6, 300):
+        return _json({"error": "slow", "msg": "Too many requests - wait a moment."}, 429)
+    data = await _body(request)
+    plan = str(data.get("plan", ""))[:6] or None
+    if plan is not None and not pay.get_plan(plan):
+        return _json({"error": "plan", "msg": "That plan is not available."}, 400)
+    try:
+        return _json(await cb(user["id"], plan))
+    except Exception as e:
+        log.error("payment link failed: %s", e)
+        return _json({"error": "pay", "msg": "Could not create the payment link. Try again in a minute."}, 502)
+
+
+@api_ad
+async def pay_check(request, user):
+    cb = stream.CTX.get("pay_check")
+    data = await _body(request)
+    lid = str(data.get("id", ""))[:60]
+    if not cb or not lid:
+        return _json({"error": "bad", "msg": "Nothing to check."}, 400)
+    if _limited(user["id"], "paychk", 40, 300):
+        return _json({"error": "slow", "msg": "Too many requests - wait a moment."}, 429)
+    try:
+        return _json(await cb(user["id"], lid))
+    except Exception as e:
+        log.error("payment check failed: %s", e)
+        return _json({"error": "pay", "msg": "Could not check the payment right now."}, 502)
 
 
 def _play_info(sid, seq):
@@ -460,4 +514,7 @@ def add_routes(app):
     app.router.add_post("/api/hb", listen_hb)
     app.router.add_post("/api/send", send)
     app.router.add_post("/api/request", request_series)
+    app.router.add_post("/api/fav", set_fav)
+    app.router.add_post("/api/pay/create", pay_create)
+    app.router.add_post("/api/pay/check", pay_check)
     app.router.add_get("/m/{tok}", audio)

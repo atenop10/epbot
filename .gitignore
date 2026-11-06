@@ -1,0 +1,10 @@
+# secrets and server-only files - never upload these
+.env
+bot.db
+ad.html
+venv/
+__pycache__/
+*.pyc
+*.orig
+*.bak
+head_tags.html
